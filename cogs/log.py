@@ -8,9 +8,9 @@ from datetime import datetime
 from typing import Optional
 
 try:
-    import pymongo
+    import motor.motor_asyncio
 except ImportError:
-    pymongo = None
+    motor = None
 
 # Authorized user IDs (You + Your Client)
 AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
@@ -21,14 +21,15 @@ SUCCESS_COLOR = discord.Color.green()
 
 _mongo_client = None
 
+
 def get_db():
     global _mongo_client
     mongo_uri = os.getenv("MONGO_URI")
-    if not mongo_uri or not pymongo:
+    if not mongo_uri or motor is None:
         return None
     if _mongo_client is None:
         try:
-            _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+            _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=2000)
         except Exception:
             return None
     try:
@@ -89,7 +90,7 @@ class RobloxAuditLogger(commands.Cog):
             return await interaction.followup.send(
                 embed=discord.Embed(
                     title="❌ Database Error",
-                    description="Could not connect to MongoDB Atlas.",
+                    description="Could not connect to MongoDB Atlas. Check that `MONGO_URI` is set and `motor` is installed.",
                     color=ERROR_COLOR
                 ),
                 ephemeral=True
@@ -99,31 +100,40 @@ class RobloxAuditLogger(commands.Cog):
 
         # Fetch Roblox Group Info
         group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
-        async with session.get(group_url) as resp:
-            if resp.status != 200:
-                return await interaction.followup.send(
-                    embed=discord.Embed(
-                        title="❌ Invalid Roblox Group",
-                        description=f"Group ID `{group_id}` does not exist on Roblox.",
-                        color=ERROR_COLOR
-                    ),
-                    ephemeral=True
-                )
-            group_data = await resp.json()
-            group_name = group_data.get("name", f"Group {group_id}")
+        try:
+            async with session.get(group_url) as resp:
+                if resp.status != 200:
+                    return await interaction.followup.send(
+                        embed=discord.Embed(
+                            title="❌ Invalid Roblox Group",
+                            description=f"Group ID `{group_id}` does not exist on Roblox.",
+                            color=ERROR_COLOR
+                        ),
+                        ephemeral=True
+                    )
+                group_data = await resp.json()
+                group_name = group_data.get("name", f"Group {group_id}")
+        except aiohttp.ClientError as e:
+            return await interaction.followup.send(
+                embed=discord.Embed(title="❌ Roblox API Error", description=f"```{str(e)[:300]}```", color=ERROR_COLOR),
+                ephemeral=True
+            )
 
         # Fetch latest Audit Log ID so historical logs aren't spammed
         audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-logs?limit=1"
         last_audit_id = None
-        async with session.get(audit_url) as resp:
-            if resp.status == 200:
-                body = await resp.json()
-                logs = body.get("data", [])
-                if logs:
-                    last_audit_id = logs[0].get("id")
+        try:
+            async with session.get(audit_url) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    logs = body.get("data", [])
+                    if logs:
+                        last_audit_id = logs[0].get("id")
+        except aiohttp.ClientError:
+            pass  # Non-fatal — worst case it re-announces recent logs once.
 
         # Save configuration
-        db["group_configs"].update_one(
+        await db["group_configs"].update_one(
             {"guild_id": str(interaction.guild.id), "group_id": group_id},
             {
                 "$set": {
@@ -155,6 +165,7 @@ class RobloxAuditLogger(commands.Cog):
         name="remove-setup",
         description="Remove a Roblox Group audit setup from this server (Authorized Owners Only)."
     )
+    @app_commands.describe(group_id="The Roblox Group ID to stop tracking.")
     async def remove_setup_cmd(self, interaction: discord.Interaction, group_id: int):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
@@ -162,15 +173,22 @@ class RobloxAuditLogger(commands.Cog):
                 ephemeral=True
             )
 
+        await interaction.response.defer(ephemeral=True)
         db = get_db()
         if db is None:
-            return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
 
-        res = db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
+        res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.response.send_message(embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}` for this server.", color=SUCCESS_COLOR), ephemeral=True)
+            await interaction.followup.send(
+                embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}` for this server.", color=SUCCESS_COLOR),
+                ephemeral=True
+            )
         else:
-            await interaction.response.send_message(embed=discord.Embed(title="❌ Not Found", description=f"No configuration found for Group ID `{group_id}` in this server.", color=ERROR_COLOR), ephemeral=True)
+            await interaction.followup.send(
+                embed=discord.Embed(title="❌ Not Found", description=f"No configuration found for Group ID `{group_id}` in this server.", color=ERROR_COLOR),
+                ephemeral=True
+            )
 
     @app_commands.command(
         name="list-setups",
@@ -178,15 +196,19 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def list_setups_cmd(self, interaction: discord.Interaction):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to run this command.", color=ERROR_COLOR), ephemeral=True)
+            return await interaction.response.send_message(
+                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to run this command.", color=ERROR_COLOR),
+                ephemeral=True
+            )
 
+        await interaction.response.defer(ephemeral=True)
         db = get_db()
         if db is None:
-            return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
         lines = []
-        for doc in cursor:
+        async for doc in cursor:
             g_name = doc.get("group_name", "Group")
             g_id = doc.get("group_id")
             ch_id = doc.get("channel_id")
@@ -197,7 +219,7 @@ class RobloxAuditLogger(commands.Cog):
             description="\n".join(lines) if lines else "*(No active group setups for this server)*",
             color=EMBED_COLOR
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ====================================================================
     # Background Audit Log Poller
@@ -205,13 +227,24 @@ class RobloxAuditLogger(commands.Cog):
 
     @tasks.loop(seconds=25.0)
     async def poll_logs_task(self):
+        # This wrapper exists so a single unexpected error (a Mongo hiccup, a
+        # malformed API response, whatever) logs and gets retried next cycle
+        # instead of silently killing the entire polling loop forever — which
+        # is what discord.py's tasks.loop does by default on an unhandled
+        # exception.
+        try:
+            await self._poll_logs_once()
+        except Exception as e:
+            print(f"[RobloxAuditLogger] poll_logs_task error: {e}")
+
+    async def _poll_logs_once(self):
         await self.bot.wait_until_ready()
         db = get_db()
         if db is None:
             return
 
         session = await self.get_http_session()
-        configs = list(db["group_configs"].find())
+        configs = await db["group_configs"].find().to_list(length=None)
 
         for cfg in configs:
             group_id = cfg.get("group_id")
@@ -247,7 +280,7 @@ class RobloxAuditLogger(commands.Cog):
                         continue
 
                     # Save the ID of the newest audit entry
-                    db["group_configs"].update_one(
+                    await db["group_configs"].update_one(
                         {"_id": cfg["_id"]},
                         {"$set": {"last_audit_id": new_logs[0]["id"]}}
                     )
@@ -332,23 +365,28 @@ class RobloxAuditLogger(commands.Cog):
                         elif action_type == "Post Shout":
                             shout_text = description.get("Text", "*(Empty Shout)*")
                             embed.description = "📢 Group shout updated."
-                            embed.add_field(name="Shout Content", value=f"else:
-# Generic Activity Handler
-details = ""
-if isinstance(description, dict):
-for k, v in description.items():
-details += f"{k}: ⁠{v}⁠\n"
-else:
-details = str(description)
-embed.description = f"Activity recorded for {group_link}."
-if details:
-embed.add_field(name="Details", value=details[:1024], inline=False)
-try:
-await channel.send(embed=embed)
-except Exception:
-pass
-except Exception:
-pass
-async def setup(bot: commands.Bot):
-await bot.add_cog(RobloxAuditLogger(bot))
+                            embed.add_field(name="Shout Content", value=shout_text[:1024] or "*(Empty Shout)*", inline=False)
 
+                        else:
+                            # Generic Activity Handler — covers any audit action
+                            # type not explicitly handled above.
+                            details = ""
+                            if isinstance(description, dict):
+                                for k, v in description.items():
+                                    details += f"{k}: `{v}`\n"
+                            else:
+                                details = str(description)
+                            embed.description = f"Activity recorded for {group_link}."
+                            if details:
+                                embed.add_field(name="Details", value=details[:1024], inline=False)
+
+                        try:
+                            await channel.send(embed=embed)
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(RobloxAuditLogger(bot))
