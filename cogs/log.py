@@ -53,7 +53,19 @@ class RobloxAuditLogger(commands.Cog):
 
     async def get_http_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            cookie_str = os.getenv("ROBLOX_COOKIE")
+            cookies = {}
+            if cookie_str:
+                # Clean up formatting if user includes .ROBLOSECURITY= prefix
+                clean_cookie = cookie_str.strip()
+                if ".ROBLOSECURITY=" in clean_cookie:
+                    clean_cookie = clean_cookie.split(".ROBLOSECURITY=")[-1]
+                cookies = {".ROBLOSECURITY": clean_cookie}
+
+            self.session = aiohttp.ClientSession(headers=headers, cookies=cookies)
         return self.session
 
     # ====================================================================
@@ -94,6 +106,7 @@ class RobloxAuditLogger(commands.Cog):
             group_data = await resp.json()
             group_name = group_data.get("name", f"Group {group_id}")
 
+        # Check audit log access
         audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
         last_audit_id = None
         async with session.get(audit_url) as resp:
@@ -102,6 +115,15 @@ class RobloxAuditLogger(commands.Cog):
                 logs = body.get("data", [])
                 if logs:
                     last_audit_id = logs[0].get("id")
+            elif resp.status in [401, 403]:
+                return await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="⚠️ Permission Required",
+                        description=f"Roblox audit logs for **{group_name}** (`{group_id}`) are protected.\n\nTo log this group, add a Roblox account to the group with 'View Audit Log' permissions and add its `.ROBLOSECURITY` cookie to Render as an environment variable named `ROBLOX_COOKIE`.",
+                        color=ORANGE_COLOR
+                    ),
+                    ephemeral=True
+                )
 
         db["group_configs"].update_one(
             {"guild_id": str(interaction.guild.id), "group_id": group_id},
@@ -207,6 +229,7 @@ class RobloxAuditLogger(commands.Cog):
             try:
                 async with session.get(url) as resp:
                     if resp.status != 200:
+                        print(f"[POLLER] Group {group_id} returned HTTP {resp.status}. (If 401/403, set ROBLOX_COOKIE in Render).")
                         continue
 
                     body = await resp.json()
@@ -247,7 +270,6 @@ class RobloxAuditLogger(commands.Cog):
                         description = entry.get("description", {})
                         created_dt = entry.get("created")
 
-                        # Timestamp formatting like: "Wednesday, August 19, 2026 at 1:56 AM"
                         timestamp_fmt = "<t:0:F>"
                         if created_dt:
                             try:
@@ -258,9 +280,7 @@ class RobloxAuditLogger(commands.Cog):
 
                         group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
-                        # -------------------------------------------------------------------
-                        # Match exact format from client image
-                        # -------------------------------------------------------------------
+                        # Exact layout matching your client's screenshot
                         if action_type in ["Change Rank", "Promote Member", "Demote Member"]:
                             target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
                             target_id = description.get("TargetId")
@@ -284,15 +304,11 @@ class RobloxAuditLogger(commands.Cog):
 
                             desc_content = f"{header_title}\n\n{sub_text}"
 
-                            embed = discord.Embed(
-                                description=desc_content,
-                                color=color_side
-                            )
+                            embed = discord.Embed(description=desc_content, color=color_side)
                             embed.add_field(name="User", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
                             embed.add_field(name="Old Rank", value=old_role, inline=False)
                             embed.add_field(name="New Rank", value=new_role, inline=False)
-
                             embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
                             embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
@@ -305,14 +321,10 @@ class RobloxAuditLogger(commands.Cog):
 
                             desc_content = f"An individual has **joined the group**\n\n{target_user} has **joined the group**"
 
-                            embed = discord.Embed(
-                                description=desc_content,
-                                color=GREEN_COLOR
-                            )
+                            embed = discord.Embed(description=desc_content, color=GREEN_COLOR)
                             embed.add_field(name="User", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
                             embed.add_field(name="Rank", value=role_name, inline=False)
-
                             embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
                             embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
@@ -323,22 +335,14 @@ class RobloxAuditLogger(commands.Cog):
 
                             desc_content = f"An individual has been **exiled**\n\n{target_user} has been **exiled**"
 
-                            embed = discord.Embed(
-                                description=desc_content,
-                                color=RED_COLOR
-                            )
+                            embed = discord.Embed(description=desc_content, color=RED_COLOR)
                             embed.add_field(name="User", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
-
                             embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
                             embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
                         else:
-                            # Default fallback format
-                            embed = discord.Embed(
-                                description=f"An activity occurred in the group\n\n**Action**: `{action_type}`",
-                                color=BLUE_COLOR
-                            )
+                            embed = discord.Embed(description=f"An activity occurred in the group\n\n**Action**: `{action_type}`", color=BLUE_COLOR)
                             embed.add_field(name="Performer", value=f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else actor_name, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
                             embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
@@ -349,8 +353,8 @@ class RobloxAuditLogger(commands.Cog):
                         except Exception:
                             pass
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[POLLER] Exception: {e}")
 
 
 async def setup(bot: commands.Bot):
