@@ -8,28 +8,28 @@ from datetime import datetime
 from typing import Optional
 
 try:
-    import motor.motor_asyncio
+    import pymongo
 except ImportError:
-    motor = None
+    pymongo = None
 
 # Authorized user IDs (You + Your Client)
 AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
 
-EMBED_COLOR = discord.Color.blue()
-ERROR_COLOR = discord.Color.red()
-SUCCESS_COLOR = discord.Color.green()
+GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
+ORANGE_COLOR = discord.Color.from_rgb(211, 84, 0)
+RED_COLOR = discord.Color.from_rgb(192, 57, 43)
+BLUE_COLOR = discord.Color.from_rgb(41, 128, 185)
 
 _mongo_client = None
-
 
 def get_db():
     global _mongo_client
     mongo_uri = os.getenv("MONGO_URI")
-    if not mongo_uri or motor is None:
+    if not mongo_uri or not pymongo:
         return None
     if _mongo_client is None:
         try:
-            _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=2000)
+            _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
         except Exception:
             return None
     try:
@@ -76,64 +76,34 @@ class RobloxAuditLogger(commands.Cog):
     ):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="❌ Permission Denied",
-                    description="You are not authorized to use this command.",
-                    color=ERROR_COLOR
-                ),
+                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
                 ephemeral=True
             )
 
         await interaction.response.defer(ephemeral=True)
         db = get_db()
         if db is None:
-            return await interaction.followup.send(
-                embed=discord.Embed(
-                    title="❌ Database Error",
-                    description="Could not connect to MongoDB Atlas. Check that `MONGO_URI` is set and `motor` is installed.",
-                    color=ERROR_COLOR
-                ),
-                ephemeral=True
-            )
+            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", description="Could not connect to MongoDB Atlas.", color=RED_COLOR), ephemeral=True)
 
         session = await self.get_http_session()
 
-        # Fetch Roblox Group Info
         group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
-        try:
-            async with session.get(group_url) as resp:
-                if resp.status != 200:
-                    return await interaction.followup.send(
-                        embed=discord.Embed(
-                            title="❌ Invalid Roblox Group",
-                            description=f"Group ID `{group_id}` does not exist on Roblox.",
-                            color=ERROR_COLOR
-                        ),
-                        ephemeral=True
-                    )
-                group_data = await resp.json()
-                group_name = group_data.get("name", f"Group {group_id}")
-        except aiohttp.ClientError as e:
-            return await interaction.followup.send(
-                embed=discord.Embed(title="❌ Roblox API Error", description=f"```{str(e)[:300]}```", color=ERROR_COLOR),
-                ephemeral=True
-            )
+        async with session.get(group_url) as resp:
+            if resp.status != 200:
+                return await interaction.followup.send(embed=discord.Embed(title="❌ Invalid Roblox Group", description=f"Group ID `{group_id}` does not exist on Roblox.", color=RED_COLOR), ephemeral=True)
+            group_data = await resp.json()
+            group_name = group_data.get("name", f"Group {group_id}")
 
-        # Fetch latest Audit Log ID so historical logs aren't spammed
-        audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-logs?limit=1"
+        audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
         last_audit_id = None
-        try:
-            async with session.get(audit_url) as resp:
-                if resp.status == 200:
-                    body = await resp.json()
-                    logs = body.get("data", [])
-                    if logs:
-                        last_audit_id = logs[0].get("id")
-        except aiohttp.ClientError:
-            pass  # Non-fatal — worst case it re-announces recent logs once.
+        async with session.get(audit_url) as resp:
+            if resp.status == 200:
+                body = await resp.json()
+                logs = body.get("data", [])
+                if logs:
+                    last_audit_id = logs[0].get("id")
 
-        # Save configuration
-        await db["group_configs"].update_one(
+        db["group_configs"].update_one(
             {"guild_id": str(interaction.guild.id), "group_id": group_id},
             {
                 "$set": {
@@ -152,12 +122,12 @@ class RobloxAuditLogger(commands.Cog):
         embed = discord.Embed(
             title="✅ Roblox Group Logger Configured",
             description=(
-                f"**Roblox Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
+                f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
                 f"**Group ID**: `{group_id}`\n"
-                f"**Logging Channel**: {channel.mention}\n"
+                f"**Channel**: {channel.mention}\n"
                 f"**Server**: `{interaction.guild.name}`"
             ),
-            color=SUCCESS_COLOR
+            color=GREEN_COLOR
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -165,30 +135,19 @@ class RobloxAuditLogger(commands.Cog):
         name="remove-setup",
         description="Remove a Roblox Group audit setup from this server (Authorized Owners Only)."
     )
-    @app_commands.describe(group_id="The Roblox Group ID to stop tracking.")
     async def remove_setup_cmd(self, interaction: discord.Interaction, group_id: int):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(
-                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to run this command.", color=ERROR_COLOR),
-                ephemeral=True
-            )
+            return await interaction.response.send_message(embed=discord.Embed(title="❌ Permission Denied", color=RED_COLOR), ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
 
-        res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
+        res = db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.followup.send(
-                embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}` for this server.", color=SUCCESS_COLOR),
-                ephemeral=True
-            )
+            await interaction.response.send_message(embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
         else:
-            await interaction.followup.send(
-                embed=discord.Embed(title="❌ Not Found", description=f"No configuration found for Group ID `{group_id}` in this server.", color=ERROR_COLOR),
-                ephemeral=True
-            )
+            await interaction.response.send_message(embed=discord.Embed(title="❌ Not Found", description=f"No configuration for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
 
     @app_commands.command(
         name="list-setups",
@@ -196,19 +155,15 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def list_setups_cmd(self, interaction: discord.Interaction):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(
-                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to run this command.", color=ERROR_COLOR),
-                ephemeral=True
-            )
+            return await interaction.response.send_message(embed=discord.Embed(title="❌ Permission Denied", color=RED_COLOR), ephemeral=True)
 
-        await interaction.response.defer(ephemeral=True)
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=ERROR_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
         lines = []
-        async for doc in cursor:
+        for doc in cursor:
             g_name = doc.get("group_name", "Group")
             g_id = doc.get("group_id")
             ch_id = doc.get("channel_id")
@@ -216,35 +171,24 @@ class RobloxAuditLogger(commands.Cog):
 
         embed = discord.Embed(
             title="📋 Server Group Log Configurations",
-            description="\n".join(lines) if lines else "*(No active group setups for this server)*",
-            color=EMBED_COLOR
+            description="\n".join(lines) if lines else "*(No active group setups)*",
+            color=BLUE_COLOR
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ====================================================================
     # Background Audit Log Poller
     # ====================================================================
 
-    @tasks.loop(seconds=25.0)
+    @tasks.loop(seconds=20.0)
     async def poll_logs_task(self):
-        # This wrapper exists so a single unexpected error (a Mongo hiccup, a
-        # malformed API response, whatever) logs and gets retried next cycle
-        # instead of silently killing the entire polling loop forever — which
-        # is what discord.py's tasks.loop does by default on an unhandled
-        # exception.
-        try:
-            await self._poll_logs_once()
-        except Exception as e:
-            print(f"[RobloxAuditLogger] poll_logs_task error: {e}")
-
-    async def _poll_logs_once(self):
         await self.bot.wait_until_ready()
         db = get_db()
         if db is None:
             return
 
         session = await self.get_http_session()
-        configs = await db["group_configs"].find().to_list(length=None)
+        configs = list(db["group_configs"].find())
 
         for cfg in configs:
             group_id = cfg.get("group_id")
@@ -259,7 +203,7 @@ class RobloxAuditLogger(commands.Cog):
             if not channel:
                 continue
 
-            url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-logs?limit=10"
+            url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=5"
             try:
                 async with session.get(url) as resp:
                     if resp.status != 200:
@@ -270,9 +214,17 @@ class RobloxAuditLogger(commands.Cog):
                     if not logs:
                         continue
 
+                    if last_audit_id is None:
+                        newest_id = logs[0].get("id")
+                        db["group_configs"].update_one(
+                            {"_id": cfg["_id"]},
+                            {"$set": {"last_audit_id": newest_id}}
+                        )
+                        continue
+
                     new_logs = []
                     for item in logs:
-                        if last_audit_id and item.get("id") == last_audit_id:
+                        if item.get("id") == last_audit_id:
                             break
                         new_logs.append(item)
 
@@ -280,7 +232,7 @@ class RobloxAuditLogger(commands.Cog):
                         continue
 
                     # Save the ID of the newest audit entry
-                    await db["group_configs"].update_one(
+                    db["group_configs"].update_one(
                         {"_id": cfg["_id"]},
                         {"$set": {"last_audit_id": new_logs[0]["id"]}}
                     )
@@ -295,7 +247,7 @@ class RobloxAuditLogger(commands.Cog):
                         description = entry.get("description", {})
                         created_dt = entry.get("created")
 
-                        # Format Unix timestamp for Discord
+                        # Timestamp formatting like: "Wednesday, August 19, 2026 at 1:56 AM"
                         timestamp_fmt = "<t:0:F>"
                         if created_dt:
                             try:
@@ -304,89 +256,103 @@ class RobloxAuditLogger(commands.Cog):
                             except Exception:
                                 pass
 
-                        # Link definitions
                         group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
-                        actor_link = f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else f"`{actor_name}`"
 
-                        embed = discord.Embed(
-                            title=f"🚨 Roblox Group Activity: {action_type}",
-                            color=EMBED_COLOR
-                        )
-                        embed.add_field(name="Group", value=group_link, inline=True)
-                        embed.add_field(name="Performer", value=actor_link, inline=True)
-                        embed.add_field(name="Timestamp", value=timestamp_fmt, inline=False)
-
-                        # Rank Change Detection (Promotions, Demotions, Manual Rank Shifts)
+                        # -------------------------------------------------------------------
+                        # Match exact format from client image
+                        # -------------------------------------------------------------------
                         if action_type in ["Change Rank", "Promote Member", "Demote Member"]:
                             target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
                             target_id = description.get("TargetId")
-                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"`{target_user}`"
+                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
                             old_role = description.get("OldRoleSetHeader", description.get("OldRoleSetName", "Unknown"))
                             new_role = description.get("NewRoleSetHeader", description.get("NewRoleSetName", "Unknown"))
 
-                            old_rank = description.get("OldRank", "")
-                            new_rank = description.get("NewRank", "")
-
-                            old_display = f"{old_role} (`{old_rank}`)" if old_rank != "" else f"{old_role}"
-                            new_display = f"{new_role} (`{new_rank}`)" if new_rank != "" else f"{new_role}"
-
-                            # Determine status message
-                            status_msg = "A user's rank has been modified."
                             if action_type == "Demote Member":
-                                status_msg = "⚠️ A user has been demoted."
-                                embed.color = discord.Color.orange()
+                                header_title = "An individual has been **demoted**"
+                                sub_text = f"{target_user} has been **demoted**"
+                                color_side = ORANGE_COLOR
                             elif action_type == "Promote Member":
-                                status_msg = "🎉 A user has been promoted."
-                                embed.color = SUCCESS_COLOR
+                                header_title = "An individual has been **promoted**"
+                                sub_text = f"{target_user} has been **promoted**"
+                                color_side = GREEN_COLOR
+                            else:
+                                header_title = "An individual's rank has been **changed**"
+                                sub_text = f"{target_user}'s rank has been **changed**"
+                                color_side = BLUE_COLOR
 
-                            embed.description = status_msg
-                            embed.add_field(name="Target User", value=target_link, inline=False)
-                            embed.add_field(name="Old Rank", value=f"`{old_display}`", inline=True)
-                            embed.add_field(name="New Rank", value=f"`{new_display}`", inline=True)
+                            desc_content = f"{header_title}\n\n{sub_text}"
+
+                            embed = discord.Embed(
+                                description=desc_content,
+                                color=color_side
+                            )
+                            embed.add_field(name="User", value=target_link, inline=False)
+                            embed.add_field(name="Group", value=group_link, inline=False)
+                            embed.add_field(name="Old Rank", value=old_role, inline=False)
+                            embed.add_field(name="New Rank", value=new_role, inline=False)
+
+                            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+                            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+
+                        elif action_type in ["Accept Join Request", "Join Group"]:
+                            target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
+                            target_id = description.get("TargetId", actor_id)
+                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
+
+                            role_name = description.get("NewRoleSetHeader", description.get("RoleSetName", "Member"))
+
+                            desc_content = f"An individual has **joined the group**\n\n{target_user} has **joined the group**"
+
+                            embed = discord.Embed(
+                                description=desc_content,
+                                color=GREEN_COLOR
+                            )
+                            embed.add_field(name="User", value=target_link, inline=False)
+                            embed.add_field(name="Group", value=group_link, inline=False)
+                            embed.add_field(name="Rank", value=role_name, inline=False)
+
+                            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+                            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
                         elif action_type == "Exil Member":
                             target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
                             target_id = description.get("TargetId")
-                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"`{target_user}`"
+                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
-                            embed.description = "❌ A user has been exiled from the group."
-                            embed.color = ERROR_COLOR
-                            embed.add_field(name="Exiled User", value=target_link, inline=False)
+                            desc_content = f"An individual has been **exiled**\n\n{target_user} has been **exiled**"
 
-                        elif action_type in ["Accept Join Request", "Decline Join Request"]:
-                            target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
-                            target_id = description.get("TargetId")
-                            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"`{target_user}`"
-
-                            embed.description = f"📩 Join request {action_type.lower()}ed."
+                            embed = discord.Embed(
+                                description=desc_content,
+                                color=RED_COLOR
+                            )
                             embed.add_field(name="User", value=target_link, inline=False)
+                            embed.add_field(name="Group", value=group_link, inline=False)
 
-                        elif action_type == "Post Shout":
-                            shout_text = description.get("Text", "*(Empty Shout)*")
-                            embed.description = "📢 Group shout updated."
-                            embed.add_field(name="Shout Content", value=shout_text[:1024] or "*(Empty Shout)*", inline=False)
+                            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+                            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
                         else:
-                            # Generic Activity Handler — covers any audit action
-                            # type not explicitly handled above.
-                            details = ""
-                            if isinstance(description, dict):
-                                for k, v in description.items():
-                                    details += f"{k}: `{v}`\n"
-                            else:
-                                details = str(description)
-                            embed.description = f"Activity recorded for {group_link}."
-                            if details:
-                                embed.add_field(name="Details", value=details[:1024], inline=False)
+                            # Default fallback format
+                            embed = discord.Embed(
+                                description=f"An activity occurred in the group\n\n**Action**: `{action_type}`",
+                                color=BLUE_COLOR
+                            )
+                            embed.add_field(name="Performer", value=f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else actor_name, inline=False)
+                            embed.add_field(name="Group", value=group_link, inline=False)
+                            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+                            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
                         try:
                             await channel.send(embed=embed)
                         except Exception:
                             pass
+
             except Exception:
-                continue
+                pass
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(RobloxAuditLogger(bot))
+
