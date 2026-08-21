@@ -114,7 +114,6 @@ class RobloxAuditLogger(commands.Cog):
 
                 m_data = await self._safe_fetch_json(members_url)
                 if m_data is None:
-                    # Mark batch incomplete so we abort public poll instead of spamming false joins/demotions
                     all_pages_succeeded = False
                     break
 
@@ -169,7 +168,7 @@ class RobloxAuditLogger(commands.Cog):
 
             group_name = group_data.get("name", f"Group {group_id}")
 
-            # Check if Audit Logs are accessible
+            # Check audit log baseline
             audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
             session = await self.get_http_session()
             
@@ -181,6 +180,7 @@ class RobloxAuditLogger(commands.Cog):
                     body = await resp.json()
                     logs = body.get("data", [])
                     if logs:
+                        # Store current latest ID as watermark (no logs sent during setup)
                         last_audit_id = logs[0].get("id")
                 else:
                     mode = "public_polling"
@@ -188,10 +188,11 @@ class RobloxAuditLogger(commands.Cog):
             created_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
             if mode == "public_polling":
+                # Build silent member baseline (no logs sent during setup)
                 initial_member_cache, success = await self._fetch_all_group_members(group_id)
                 if not success:
                     return await interaction.followup.send(
-                        embed=discord.Embed(title="❌ Roblox API Error", description="Failed to fetch complete group member roster from Roblox.", color=RED_COLOR),
+                        embed=discord.Embed(title="❌ Roblox API Error", description="Failed to fetch initial group roster from Roblox.", color=RED_COLOR),
                         ephemeral=True
                     )
 
@@ -237,7 +238,8 @@ class RobloxAuditLogger(commands.Cog):
                     f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
                     f"**Group ID**: `{group_id}`\n"
                     f"**Channel**: {channel.mention}\n"
-                    f"**Tracking Mode**: `{mode_msg}`"
+                    f"**Tracking Mode**: `{mode_msg}`\n\n"
+                    f"🟢 *Baseline watermark established. Only events occurring after this moment will be logged.*"
                 ),
                 color=GREEN_COLOR
             )
@@ -328,7 +330,6 @@ class RobloxAuditLogger(commands.Cog):
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name)
                 else:
-                    # Public polling runs every 3rd loop cycle (~60s) to safeguard API limit
                     if self.cycle_count % 3 == 0:
                         await self.poll_public_mode(db, cfg, channel, group_id, group_name)
 
@@ -337,11 +338,10 @@ class RobloxAuditLogger(commands.Cog):
 
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name):
         last_audit_id = cfg.get("last_audit_id")
-        url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=5"
+        url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=10"
         try:
             async with session.get(url) as resp:
                 if resp.status in [401, 403]:
-                    # Switch to public fallback if cookie expires or fails
                     await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
                     return
 
@@ -353,6 +353,7 @@ class RobloxAuditLogger(commands.Cog):
                 if not logs:
                     return
 
+                # Baseline watermark check
                 if last_audit_id is None:
                     await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": logs[0].get("id")}})
                     return
@@ -366,6 +367,7 @@ class RobloxAuditLogger(commands.Cog):
                 if not new_logs:
                     return
 
+                # Update watermark to the newest audit entry BEFORE logging
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": new_logs[0]["id"]}})
 
                 for entry in reversed(new_logs):
@@ -378,22 +380,21 @@ class RobloxAuditLogger(commands.Cog):
         try:
             current_members, is_complete = await self._fetch_all_group_members(group_id)
             
-            # Guard against partial API responses (prevents spam demote/promote/join events)
             if not is_complete or not current_members:
                 return
 
+            # Silent baseline check
             if not cached_members:
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
                 return
 
-            # Safety Threshold: If retrieved count drops by >15% unexpectedly, skip this cycle
             if len(cached_members) > 20 and len(current_members) < (len(cached_members) * 0.85):
                 return
 
             now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
-            # 1. Check for Joins & Rank Changes
+            # 1. Joins & Rank Changes
             for uid, info in current_members.items():
                 target_user = info["username"]
                 target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
@@ -442,7 +443,7 @@ class RobloxAuditLogger(commands.Cog):
                         except Exception:
                             pass
 
-            # 2. Check for Leaves / Exiles
+            # 2. Leaves & Exiles
             for uid, old_info in cached_members.items():
                 if uid not in current_members:
                     target_user = old_info.get("username", f"User {uid}")
