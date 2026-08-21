@@ -12,7 +12,6 @@ try:
 except ImportError:
     motor = None
 
-# Authorized user IDs (You + Your Client)
 AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
 
 GREEN_COLOR = discord.Color.from_rgb(46, 139, 87)
@@ -39,7 +38,6 @@ def get_db():
         return _mongo_client["roblox_audit_logger"]
     except Exception:
         return None
-
 
 def is_authorized_user(user_id: int) -> bool:
     return user_id in AUTHORIZED_USER_IDS
@@ -72,7 +70,6 @@ class RobloxAuditLogger(commands.Cog):
         return self.session
 
     async def _safe_fetch_json(self, url: str, retries: int = 3) -> Optional[Dict[str, Any]]:
-        """Fetch JSON with bounded backoff handling for 429 rate limits."""
         session = await self.get_http_session()
         for attempt in range(retries):
             try:
@@ -90,15 +87,16 @@ class RobloxAuditLogger(commands.Cog):
                 await asyncio.sleep(1)
         return None
 
-    async def _fetch_all_group_members(self, group_id: int) -> Dict[str, Dict[str, Any]]:
-        """Paginate through all group roles and users to construct a full member map."""
+    async def _fetch_all_group_members(self, group_id: int) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        """Fetch group members. Returns (member_map, is_complete_success)."""
         roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
         r_data = await self._safe_fetch_json(roles_url)
         if not r_data:
-            return {}
+            return {}, False
 
         roles = r_data.get("roles", [])
         member_map = {}
+        all_pages_succeeded = True
 
         for role in roles:
             role_id = role.get("id")
@@ -115,7 +113,9 @@ class RobloxAuditLogger(commands.Cog):
                     members_url += f"&cursor={cursor}"
 
                 m_data = await self._safe_fetch_json(members_url)
-                if not m_data:
+                if m_data is None:
+                    # Mark batch incomplete so we abort public poll instead of spamming false joins/demotions
+                    all_pages_succeeded = False
                     break
 
                 for u in m_data.get("data", []):
@@ -130,7 +130,7 @@ class RobloxAuditLogger(commands.Cog):
                 if not cursor:
                     break
 
-        return member_map
+        return member_map, all_pages_succeeded
 
     # ====================================================================
     # Slash Commands
@@ -188,7 +188,13 @@ class RobloxAuditLogger(commands.Cog):
             created_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
             if mode == "public_polling":
-                initial_member_cache = await self._fetch_all_group_members(group_id)
+                initial_member_cache, success = await self._fetch_all_group_members(group_id)
+                if not success:
+                    return await interaction.followup.send(
+                        embed=discord.Embed(title="❌ Roblox API Error", description="Failed to fetch complete group member roster from Roblox.", color=RED_COLOR),
+                        ephemeral=True
+                    )
+
                 await db["group_configs"].update_one(
                     {"guild_id": str(interaction.guild.id), "group_id": group_id},
                     {
@@ -223,7 +229,7 @@ class RobloxAuditLogger(commands.Cog):
                     upsert=True
                 )
 
-            mode_msg = "Audit Log Stream (Direct)" if mode == "audit_log" else "Public Polling Stream (Cookie-Free Fallback)"
+            mode_msg = "Audit Log Stream (Direct Cookie)" if mode == "audit_log" else "Public Polling Stream (Cookie-Free Fallback)"
 
             embed = discord.Embed(
                 title="✅ Roblox Group Logger Configured",
@@ -322,7 +328,7 @@ class RobloxAuditLogger(commands.Cog):
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name)
                 else:
-                    # Public polling runs every 3rd loop cycle (~60s cadence)
+                    # Public polling runs every 3rd loop cycle (~60s) to safeguard API limit
                     if self.cycle_count % 3 == 0:
                         await self.poll_public_mode(db, cfg, channel, group_id, group_name)
 
@@ -335,7 +341,7 @@ class RobloxAuditLogger(commands.Cog):
         try:
             async with session.get(url) as resp:
                 if resp.status in [401, 403]:
-                    # Switch to public fallback if audit log access is revoked
+                    # Switch to public fallback if cookie expires or fails
                     await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
                     return
 
@@ -370,24 +376,29 @@ class RobloxAuditLogger(commands.Cog):
     async def poll_public_mode(self, db, cfg, channel, group_id, group_name):
         cached_members = cfg.get("member_cache", {})
         try:
-            current_members = await self._fetch_all_group_members(group_id)
-            if not current_members:
+            current_members, is_complete = await self._fetch_all_group_members(group_id)
+            
+            # Guard against partial API responses (prevents spam demote/promote/join events)
+            if not is_complete or not current_members:
                 return
 
             if not cached_members:
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
                 return
 
-            # Detect Changes
+            # Safety Threshold: If retrieved count drops by >15% unexpectedly, skip this cycle
+            if len(cached_members) > 20 and len(current_members) < (len(cached_members) * 0.85):
+                return
+
             now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
+            # 1. Check for Joins & Rank Changes
             for uid, info in current_members.items():
                 target_user = info["username"]
                 target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                 
                 if uid not in cached_members:
-                    # Joined group
                     embed = discord.Embed(
                         description=f"An individual has **joined the group**\n\n{target_user} has **joined the group**",
                         color=GREEN_COLOR
@@ -430,6 +441,25 @@ class RobloxAuditLogger(commands.Cog):
                             await channel.send(embed=embed)
                         except Exception:
                             pass
+
+            # 2. Check for Leaves / Exiles
+            for uid, old_info in cached_members.items():
+                if uid not in current_members:
+                    target_user = old_info.get("username", f"User {uid}")
+                    target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
+                    embed = discord.Embed(
+                        description=f"An individual has **left or been exiled**\n\n{target_user} has left the group",
+                        color=RED_COLOR
+                    )
+                    embed.add_field(name="User", value=target_link, inline=False)
+                    embed.add_field(name="Group", value=group_link, inline=False)
+                    embed.add_field(name="Last Rank", value=old_info.get("role_name", "Unknown"), inline=False)
+                    embed.add_field(name="\u200b", value=now_fmt, inline=False)
+                    embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+                    try:
+                        await channel.send(embed=embed)
+                    except Exception:
+                        pass
 
             await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
 
