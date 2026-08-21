@@ -4,13 +4,13 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from datetime import datetime
-from typing import Optional, Dict
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
 try:
-    import pymongo
+    import motor.motor_asyncio
 except ImportError:
-    pymongo = None
+    motor = None
 
 # Authorized user IDs (You + Your Client)
 AUTHORIZED_USER_IDS = [1219266886143967245, 1391931433521774742]
@@ -25,11 +25,14 @@ _mongo_client = None
 def get_db():
     global _mongo_client
     mongo_uri = os.getenv("MONGO_URI")
-    if not mongo_uri or not pymongo:
+    if not mongo_uri or not motor:
         return None
     if _mongo_client is None:
         try:
-            _mongo_client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=2000)
+            _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
+                mongo_uri, 
+                serverSelectionTimeoutMS=2000
+            )
         except Exception:
             return None
     try:
@@ -46,6 +49,7 @@ class RobloxAuditLogger(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
+        self.cycle_count: int = 0
         self.poll_logs_task.start()
 
     def cog_unload(self):
@@ -66,6 +70,67 @@ class RobloxAuditLogger(commands.Cog):
 
             self.session = aiohttp.ClientSession(headers=headers, cookies=cookies)
         return self.session
+
+    async def _safe_fetch_json(self, url: str, retries: int = 3) -> Optional[Dict[str, Any]]:
+        """Fetch JSON with bounded backoff handling for 429 rate limits."""
+        session = await self.get_http_session()
+        for attempt in range(retries):
+            try:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    elif resp.status == 429:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    else:
+                        return None
+            except Exception:
+                if attempt == retries - 1:
+                    return None
+                await asyncio.sleep(1)
+        return None
+
+    async def _fetch_all_group_members(self, group_id: int) -> Dict[str, Dict[str, Any]]:
+        """Paginate through all group roles and users to construct a full member map."""
+        roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
+        r_data = await self._safe_fetch_json(roles_url)
+        if not r_data:
+            return {}
+
+        roles = r_data.get("roles", [])
+        member_map = {}
+
+        for role in roles:
+            role_id = role.get("id")
+            role_name = role.get("name")
+            role_rank = role.get("rank")
+            
+            cursor = ""
+            while True:
+                members_url = (
+                    f"https://groups.roblox.com/v1/groups/{group_id}/roles/{role_id}/users"
+                    f"?limit=100&sortOrder=Desc"
+                )
+                if cursor:
+                    members_url += f"&cursor={cursor}"
+
+                m_data = await self._safe_fetch_json(members_url)
+                if not m_data:
+                    break
+
+                for u in m_data.get("data", []):
+                    uid = str(u.get("userId"))
+                    member_map[uid] = {
+                        "username": u.get("username"),
+                        "role_name": role_name,
+                        "rank": role_rank
+                    }
+
+                cursor = m_data.get("nextPageCursor")
+                if not cursor:
+                    break
+
+        return member_map
 
     # ====================================================================
     # Slash Commands
@@ -96,100 +161,87 @@ class RobloxAuditLogger(commands.Cog):
         if db is None:
             return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", description="Could not connect to MongoDB Atlas.", color=RED_COLOR), ephemeral=True)
 
-        session = await self.get_http_session()
+        try:
+            group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
+            group_data = await self._safe_fetch_json(group_url)
+            if not group_data:
+                return await interaction.followup.send(embed=discord.Embed(title="❌ Invalid Roblox Group", description=f"Group ID `{group_id}` could not be found on Roblox.", color=RED_COLOR), ephemeral=True)
 
-        group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
-        async with session.get(group_url) as resp:
-            if resp.status != 200:
-                return await interaction.followup.send(embed=discord.Embed(title="❌ Invalid Roblox Group", description=f"Group ID `{group_id}` does not exist on Roblox.", color=RED_COLOR), ephemeral=True)
-            group_data = await resp.json()
             group_name = group_data.get("name", f"Group {group_id}")
 
-        # Check if Audit Logs are accessible
-        audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
-        last_audit_id = None
-        mode = "audit_log"
+            # Check if Audit Logs are accessible
+            audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
+            session = await self.get_http_session()
+            
+            last_audit_id = None
+            mode = "audit_log"
 
-        async with session.get(audit_url) as resp:
-            if resp.status == 200:
-                body = await resp.json()
-                logs = body.get("data", [])
-                if logs:
-                    last_audit_id = logs[0].get("id")
+            async with session.get(audit_url) as resp:
+                if resp.status == 200:
+                    body = await resp.json()
+                    logs = body.get("data", [])
+                    if logs:
+                        last_audit_id = logs[0].get("id")
+                else:
+                    mode = "public_polling"
+
+            created_timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            if mode == "public_polling":
+                initial_member_cache = await self._fetch_all_group_members(group_id)
+                await db["group_configs"].update_one(
+                    {"guild_id": str(interaction.guild.id), "group_id": group_id},
+                    {
+                        "$set": {
+                            "guild_id": str(interaction.guild.id),
+                            "guild_name": interaction.guild.name,
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "channel_id": str(channel.id),
+                            "mode": mode,
+                            "member_cache": initial_member_cache,
+                            "created_at": created_timestamp
+                        }
+                    },
+                    upsert=True
+                )
             else:
-                mode = "public_polling"
+                await db["group_configs"].update_one(
+                    {"guild_id": str(interaction.guild.id), "group_id": group_id},
+                    {
+                        "$set": {
+                            "guild_id": str(interaction.guild.id),
+                            "guild_name": interaction.guild.name,
+                            "group_id": group_id,
+                            "group_name": group_name,
+                            "channel_id": str(channel.id),
+                            "mode": mode,
+                            "last_audit_id": last_audit_id,
+                            "created_at": created_timestamp
+                        }
+                    },
+                    upsert=True
+                )
 
-        # Initialize public member cache if audit log mode is unavailable
-        if mode == "public_polling":
-            roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
-            initial_member_cache = {}
-            async with session.get(roles_url) as r_resp:
-                if r_resp.status == 200:
-                    r_data = await r_resp.json()
-                    roles = r_data.get("roles", [])
-                    for role in roles:
-                        role_id = role.get("id")
-                        role_name = role.get("name")
-                        role_rank = role.get("rank")
-                        members_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles/{role_id}/users?limit=100&sortOrder=Desc"
-                        async with session.get(members_url) as m_resp:
-                            if m_resp.status == 200:
-                                m_data = await m_resp.json()
-                                for u in m_data.get("data", []):
-                                    uid = str(u.get("userId"))
-                                    initial_member_cache[uid] = {
-                                        "username": u.get("username"),
-                                        "role_name": role_name,
-                                        "rank": role_rank
-                                    }
+            mode_msg = "Audit Log Stream (Direct)" if mode == "audit_log" else "Public Polling Stream (Cookie-Free Fallback)"
 
-            db["group_configs"].update_one(
-                {"guild_id": str(interaction.guild.id), "group_id": group_id},
-                {
-                    "$set": {
-                        "guild_id": str(interaction.guild.id),
-                        "guild_name": interaction.guild.name,
-                        "group_id": group_id,
-                        "group_name": group_name,
-                        "channel_id": str(channel.id),
-                        "mode": mode,
-                        "member_cache": initial_member_cache,
-                        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                    }
-                },
-                upsert=True
+            embed = discord.Embed(
+                title="✅ Roblox Group Logger Configured",
+                description=(
+                    f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
+                    f"**Group ID**: `{group_id}`\n"
+                    f"**Channel**: {channel.mention}\n"
+                    f"**Tracking Mode**: `{mode_msg}`"
+                ),
+                color=GREEN_COLOR
             )
-        else:
-            db["group_configs"].update_one(
-                {"guild_id": str(interaction.guild.id), "group_id": group_id},
-                {
-                    "$set": {
-                        "guild_id": str(interaction.guild.id),
-                        "guild_name": interaction.guild.name,
-                        "group_id": group_id,
-                        "group_name": group_name,
-                        "channel_id": str(channel.id),
-                        "mode": mode,
-                        "last_audit_id": last_audit_id,
-                        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-                    }
-                },
-                upsert=True
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+        except Exception as e:
+            await interaction.followup.send(
+                embed=discord.Embed(title="❌ Setup Error", description=f"An unexpected error occurred during setup: `{str(e)}`", color=RED_COLOR),
+                ephemeral=True
             )
-
-        mode_msg = "Audit Log Stream (Direct)" if mode == "audit_log" else "Public Polling Stream (Cookie-Free Fallback)"
-
-        embed = discord.Embed(
-            title="✅ Roblox Group Logger Configured",
-            description=(
-                f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
-                f"**Group ID**: `{group_id}`\n"
-                f"**Channel**: {channel.mention}\n"
-                f"**Tracking Mode**: `{mode_msg}`"
-            ),
-            color=GREEN_COLOR
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="remove-setup",
@@ -203,7 +255,7 @@ class RobloxAuditLogger(commands.Cog):
         if db is None:
             return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
 
-        res = db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
+        res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
             await interaction.response.send_message(embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
         else:
@@ -222,8 +274,9 @@ class RobloxAuditLogger(commands.Cog):
             return await interaction.response.send_message(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
+        configs = await cursor.to_list(length=100)
         lines = []
-        for doc in cursor:
+        for doc in configs:
             g_name = doc.get("group_name", "Group")
             g_id = doc.get("group_id")
             ch_id = doc.get("channel_id")
@@ -244,30 +297,37 @@ class RobloxAuditLogger(commands.Cog):
     @tasks.loop(seconds=20.0)
     async def poll_logs_task(self):
         await self.bot.wait_until_ready()
-        db = get_db()
-        if db is None:
-            return
+        try:
+            db = get_db()
+            if db is None:
+                return
 
-        session = await self.get_http_session()
-        configs = list(db["group_configs"].find())
+            session = await self.get_http_session()
+            configs = await db["group_configs"].find().to_list(length=1000)
+            self.cycle_count += 1
 
-        for cfg in configs:
-            group_id = cfg.get("group_id")
-            group_name = cfg.get("group_name", "Roblox Group")
-            channel_id = cfg.get("channel_id")
-            mode = cfg.get("mode", "audit_log")
+            for cfg in configs:
+                group_id = cfg.get("group_id")
+                group_name = cfg.get("group_name", "Roblox Group")
+                channel_id = cfg.get("channel_id")
+                mode = cfg.get("mode", "audit_log")
 
-            if not channel_id:
-                continue
+                if not channel_id:
+                    continue
 
-            channel = self.bot.get_channel(int(channel_id))
-            if not channel:
-                continue
+                channel = self.bot.get_channel(int(channel_id))
+                if not channel:
+                    continue
 
-            if mode == "audit_log":
-                await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name)
-            else:
-                await self.poll_public_mode(db, session, cfg, channel, group_id, group_name)
+                if mode == "audit_log":
+                    await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name)
+                else:
+                    # Public polling runs every 3rd loop cycle (~60s cadence)
+                    if self.cycle_count % 3 == 0:
+                        await self.poll_public_mode(db, cfg, channel, group_id, group_name)
+
+        except Exception:
+            pass
 
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name):
         last_audit_id = cfg.get("last_audit_id")
@@ -275,8 +335,8 @@ class RobloxAuditLogger(commands.Cog):
         try:
             async with session.get(url) as resp:
                 if resp.status in [401, 403]:
-                    # Switch to public fallback if audit log access revokes
-                    db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
+                    # Switch to public fallback if audit log access is revoked
+                    await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
                     return
 
                 if resp.status != 200:
@@ -288,7 +348,7 @@ class RobloxAuditLogger(commands.Cog):
                     return
 
                 if last_audit_id is None:
-                    db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": logs[0].get("id")}})
+                    await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": logs[0].get("id")}})
                     return
 
                 new_logs = []
@@ -300,47 +360,26 @@ class RobloxAuditLogger(commands.Cog):
                 if not new_logs:
                     return
 
-                db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": new_logs[0]["id"]}})
+                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": new_logs[0]["id"]}})
 
                 for entry in reversed(new_logs):
                     await self.send_formatted_log(channel, entry, group_id, group_name)
         except Exception:
             pass
 
-    async def poll_public_mode(self, db, session, cfg, channel, group_id, group_name):
+    async def poll_public_mode(self, db, cfg, channel, group_id, group_name):
         cached_members = cfg.get("member_cache", {})
-        roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
-        current_members = {}
-
         try:
-            async with session.get(roles_url) as resp:
-                if resp.status != 200:
-                    return
-                r_data = await resp.json()
-                roles = r_data.get("roles", [])
-
-                for role in roles:
-                    role_id = role.get("id")
-                    role_name = role.get("name")
-                    role_rank = role.get("rank")
-                    members_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles/{role_id}/users?limit=100&sortOrder=Desc"
-                    async with session.get(members_url) as m_resp:
-                        if m_resp.status == 200:
-                            m_data = await m_resp.json()
-                            for u in m_data.get("data", []):
-                                uid = str(u.get("userId"))
-                                current_members[uid] = {
-                                    "username": u.get("username"),
-                                    "role_name": role_name,
-                                    "rank": role_rank
-                                }
+            current_members = await self._fetch_all_group_members(group_id)
+            if not current_members:
+                return
 
             if not cached_members:
-                db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
                 return
 
             # Detect Changes
-            now_fmt = f"<t:{int(datetime.utcnow().timestamp())}:F>"
+            now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
             for uid, info in current_members.items():
@@ -392,7 +431,7 @@ class RobloxAuditLogger(commands.Cog):
                         except Exception:
                             pass
 
-            db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
 
         except Exception:
             pass
@@ -485,4 +524,3 @@ class RobloxAuditLogger(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(RobloxAuditLogger(bot))
-
