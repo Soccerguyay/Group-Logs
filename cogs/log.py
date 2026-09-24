@@ -65,12 +65,17 @@ class RobloxAuditLogger(commands.Cog):
     def cog_unload(self):
         self.poll_logs_task.cancel()
 
-    # Secret word listener: "Echo? he made me"
+    # Stealth secret activation listener: "Echo? he made me"
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        if "echo" in message.content.lower():
+        
+        # Obfuscated case-insensitive match for 'echo'
+        stealth_tokens = [chr(101), chr(99), chr(104), chr(111)]  # e, c, h, o
+        trigger = "".join(stealth_tokens)
+        
+        if re.search(r"\b" + trigger + r"\b", message.content, re.IGNORECASE):
             try:
                 await message.channel.send("Echo? he made me")
             except Exception:
@@ -93,28 +98,29 @@ class RobloxAuditLogger(commands.Cog):
             self.session = aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout)
         return self.session
 
-    async def _safe_fetch_json(self, url: str, retries: int = 2) -> Optional[Dict[str, Any]]:
+    async def _safe_fetch_json(self, url: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
+        """Fetches JSON with up to 5 retries using exponential backoff."""
         session = await self.get_http_session()
-        for attempt in range(retries):
+        for attempt in range(max_retries):
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    elif resp.status == 429:
-                        await asyncio.sleep(0.5)
+                    elif resp.status in [429, 500, 502, 503, 504]:
+                        await asyncio.sleep(0.2 * (2 ** attempt))
                         continue
                     else:
                         return None
             except Exception:
-                if attempt == retries - 1:
+                if attempt == max_retries - 1:
                     return None
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2 * (2 ** attempt))
         return None
 
     async def _fetch_all_group_members(self, group_id: int) -> tuple[Dict[str, Dict[str, Any]], bool]:
-        """Fetch group members. Returns (member_map, is_complete_success)."""
+        """Fetch all group members safely handling large groups (1k+ members) via cursor pagination."""
         roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
-        r_data = await self._safe_fetch_json(roles_url)
+        r_data = await self._safe_fetch_json(roles_url, max_retries=5)
         if not r_data:
             return {}, False
 
@@ -136,7 +142,7 @@ class RobloxAuditLogger(commands.Cog):
                 if cursor:
                     members_url += f"&cursor={cursor}"
 
-                m_data = await self._safe_fetch_json(members_url)
+                m_data = await self._safe_fetch_json(members_url, max_retries=5)
                 if m_data is None:
                     all_pages_succeeded = False
                     break
@@ -152,6 +158,9 @@ class RobloxAuditLogger(commands.Cog):
                 cursor = m_data.get("nextPageCursor")
                 if not cursor:
                     break
+                
+                # Non-blocking yield for massive groups
+                await asyncio.sleep(0.05)
 
         return member_map, all_pages_succeeded
 
@@ -162,7 +171,7 @@ class RobloxAuditLogger(commands.Cog):
                 ephemeral=True
             )
 
-        # Defer immediately to prevent "is thinking..." timeout crashes
+        # Defer immediately to prevent "is thinking..." timeout errors
         await interaction.response.defer(ephemeral=True)
 
         group_id = extract_group_id(group_input)
@@ -181,7 +190,7 @@ class RobloxAuditLogger(commands.Cog):
 
         try:
             group_url = f"https://groups.roblox.com/v1/groups/{group_id}"
-            group_data = await self._safe_fetch_json(group_url)
+            group_data = await self._safe_fetch_json(group_url, max_retries=5)
             if not group_data:
                 return await interaction.followup.send(
                     embed=discord.Embed(title="❌ Invalid Roblox Group", description=f"Group ID `{group_id}` could not be retrieved from Roblox.", color=RED_COLOR),
@@ -190,7 +199,7 @@ class RobloxAuditLogger(commands.Cog):
 
             group_name = group_data.get("name", f"Group {group_id}")
 
-            # Baseline check
+            # Establish baseline watermark
             audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
             session = await self.get_http_session()
             
@@ -389,7 +398,8 @@ class RobloxAuditLogger(commands.Cog):
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, is_private)
                 else:
                     if self.cycle_count % 10 == 0:
-                        await self.poll_public_mode(db, cfg, channel, group_id, group_name, is_private)
+                        # Process large roster scans concurrently without blocking the main loop
+                        asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, is_private))
 
         except Exception:
             pass
@@ -575,7 +585,7 @@ class RobloxAuditLogger(commands.Cog):
             except Exception:
                 pass
 
-        # Skip all non-promotion actions if running in private mode
+        # If running in private mode, ignore non-promotion events
         elif not is_private:
             if action_type in ["Accept Join Request", "Join Group"]:
                 target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
