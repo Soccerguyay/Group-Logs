@@ -113,7 +113,6 @@ class RobloxAuditLogger(commands.Cog):
                     if resp.status == 200:
                         return await resp.json()
                     elif resp.status == 429:
-                        # Back off longer when rate-limited
                         await asyncio.sleep(1.0 * (attempt + 1))
                         continue
                     elif resp.status in [500, 502, 503, 504]:
@@ -144,7 +143,6 @@ class RobloxAuditLogger(commands.Cog):
         if not roles:
             return {}, False
 
-        # Filter roles to only fetch members at or above the required rank
         target_roles = [r for r in roles if r.get("rank", 0) >= min_rank_val]
         if not target_roles:
             target_roles = roles
@@ -325,6 +323,51 @@ class RobloxAuditLogger(commands.Cog):
     # ====================================================================
 
     @app_commands.command(
+        name="log-help",
+        description="View commands, usage guides, and recommended settings for optimal performance."
+    )
+    async def log_help_cmd(self, interaction: discord.Interaction):
+        if not is_authorized_user(interaction.user.id):
+            return await interaction.response.send_message(
+                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
+                ephemeral=True
+            )
+
+        embed = discord.Embed(
+            title="📖 Roblox Group Logger - Usage & Optimization Guide",
+            description="Use the commands below to configure and monitor Roblox group audit events.",
+            color=BLUE_COLOR
+        )
+
+        embed.add_field(
+            name="🛠️ Available Commands",
+            value=(
+                "• **/setup `[channel]` `[group]`**\n"
+                "  Tracks all events for all ranks in the group.\n\n"
+                "• **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
+                "  Tracks events exclusively for members at or above a specific rank.\n\n"
+                "• **/remove-setup `[group]`**\n"
+                "  Stops logging for a specific group.\n\n"
+                "• **/list-setups**\n"
+                "  Displays all configured group logs in this server."
+            ),
+            inline=False
+        )
+
+        embed.add_field(
+            name="💡 Optimization Advice (Large Groups 1,000+ Members)",
+            value=(
+                "• **Avoid using `/setup` on massive groups** without a cookie attached. Fetching thousands of bottom-rank members triggers Roblox API rate limits.\n"
+                "• **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff or middle-tier rank (or a low rank that doesn't constantly change).\n"
+                "• **Case-Insensitive Exact Names**: When entering `min_rank_name`, type the exact rank title as shown on Roblox."
+            ),
+            inline=False
+        )
+
+        embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
         name="setup",
         description="Setup Roblox Group activity logging for ALL ranks (Authorized Owners Only)."
     )
@@ -447,7 +490,6 @@ class RobloxAuditLogger(commands.Cog):
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
                 else:
-                    # Stagger public polling cycles to prevent hitting limits on multiple large groups
                     if self.cycle_count % 5 == 0:
                         asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val))
 
@@ -485,7 +527,6 @@ class RobloxAuditLogger(commands.Cog):
                 if not new_logs:
                     return
 
-                # Update watermark to newest audit entry
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": new_logs[0]["id"]}})
 
                 for entry in reversed(new_logs):
