@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import random
 import asyncio
 import aiohttp
@@ -61,6 +62,7 @@ class RobloxAuditLogger(commands.Cog):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
         self.cycle_count: int = 0
+        self.start_time: datetime = datetime.now(timezone.utc)
         self.poll_logs_task.start()
 
     def cog_unload(self):
@@ -315,6 +317,85 @@ class RobloxAuditLogger(commands.Cog):
     # ====================================================================
 
     @app_commands.command(
+        name="ping",
+        description="View system latency, uptime, database status, and tracking overview."
+    )
+    async def ping_cmd(self, interaction: discord.Interaction):
+        start_time = time.perf_counter()
+        await interaction.response.defer(ephemeral=True)
+        end_time = time.perf_counter()
+
+        # Calculate Latencies
+        response_ms = round((end_time - start_time) * 1000)
+        gateway_ms = round(self.bot.latency * 1000)
+
+        # Database Check
+        db = get_db()
+        db_status = "Disconnected"
+        db_ms_str = "N/A"
+        total_groups = 0
+        
+        if db is not None:
+            try:
+                db_start = time.perf_counter()
+                await db.command("ping")
+                db_end = time.perf_counter()
+                db_ms_str = f"{round((db_end - db_start) * 1000)} ms"
+                db_status = "Connected"
+
+                total_groups = await db["group_configs"].count_documents({})
+            except Exception:
+                db_status = "Error"
+
+        # Calculate Uptime
+        now = datetime.now(timezone.utc)
+        uptime_delta = now - self.start_time
+        hours, remainder = divmod(int(uptime_delta.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        days, hours = divmod(hours, 24)
+
+        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s" if days > 0 else f"{hours}h {minutes}m {seconds}s"
+
+        embed = discord.Embed(
+            title="System Status Overview",
+            color=BLUE_COLOR,
+            timestamp=now
+        )
+
+        embed.add_field(
+            name="Latency",
+            value=(
+                f"**Gateway Ping**: `{gateway_ms} ms`\n"
+                f"**Response Time**: `{response_ms} ms`\n"
+                f"**Database Latency**: `{db_ms_str}`"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="System Health",
+            value=(
+                f"**Database**: `{db_status}`\n"
+                f"**Uptime**: `{uptime_str}`\n"
+                f"**Poll Cycles**: `{self.cycle_count}`"
+            ),
+            inline=True
+        )
+
+        embed.add_field(
+            name="Tracking Stats",
+            value=(
+                f"**Tracked Groups**: `{total_groups}`\n"
+                f"**Total Servers**: `{len(self.bot.guilds)}`\n"
+                f"**WebSocket Status**: `Connected`"
+            ),
+            inline=False
+        )
+
+        embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
         name="log-help",
         description="View commands, usage guides, and recommended settings for optimal performance."
     )
@@ -334,6 +415,8 @@ class RobloxAuditLogger(commands.Cog):
         embed.add_field(
             name="Available Commands",
             value=(
+                "- **/ping**\n"
+                "  View system status, ping latency, uptime, and tracking stats.\n\n"
                 "- **/setup `[channel]` `[group]`**\n"
                 "  Tracks all events for all ranks in the group.\n\n"
                 "- **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
