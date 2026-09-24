@@ -65,25 +65,15 @@ class RobloxAuditLogger(commands.Cog):
     def cog_unload(self):
         self.poll_logs_task.cancel()
 
-    # Stealth secret activation listener with auto-delete
+    # Listener for when the bot is pinged/mentioned
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
         
-        stealth_tokens = [chr(101), chr(99), chr(104), chr(111)]  # e, c, h, o
-        trigger = "".join(stealth_tokens)
-        
-        if re.search(r"\b" + trigger + r"\b", message.content, re.IGNORECASE):
+        if self.bot.user in message.mentions:
             try:
-                await message.delete()
-            except Exception:
-                pass
-
-            try:
-                bot_msg = await message.channel.send("Shhh dont tell anyone about him")
-                await asyncio.sleep(10)
-                await bot_msg.delete()
+                await message.channel.send("Son why are you pinging me? \nMy job is to log not talking 😭✌️")
             except Exception:
                 pass
 
@@ -407,23 +397,23 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def remove_setup_cmd(self, interaction: discord.Interaction, group: str):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title="❌ Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title=" Permission Denied", color=RED_COLOR), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
         group_id = extract_group_id(group)
         if not group_id:
-            return await interaction.followup.send(embed=discord.Embed(title="❌ Invalid Group Input", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title=" Invalid Group Input", color=RED_COLOR), ephemeral=True)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title=" Database Error", color=RED_COLOR), ephemeral=True)
 
         res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.followup.send(embed=discord.Embed(title="🗑️ Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title=" Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
         else:
-            await interaction.followup.send(embed=discord.Embed(title="❌ Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title=" Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
 
     @app_commands.command(
         name="list-setups",
@@ -431,13 +421,13 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def list_setups_cmd(self, interaction: discord.Interaction):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title="❌ Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title=" Permission Denied", color=RED_COLOR), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="❌ Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title=" Database Error", color=RED_COLOR), ephemeral=True)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
         configs = await cursor.to_list(length=100)
