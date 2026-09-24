@@ -71,18 +71,15 @@ class RobloxAuditLogger(commands.Cog):
         if message.author.bot:
             return
         
-        # Obfuscated case-insensitive match for 'echo'
         stealth_tokens = [chr(101), chr(99), chr(104), chr(111)]  # e, c, h, o
         trigger = "".join(stealth_tokens)
         
         if re.search(r"\b" + trigger + r"\b", message.content, re.IGNORECASE):
-            # Delete the user's trigger message right away
             try:
                 await message.delete()
             except Exception:
                 pass
 
-            # Send stealth response and delete it after 10 seconds
             try:
                 bot_msg = await message.channel.send("Shhh dont tell anyone about him")
                 await asyncio.sleep(10)
@@ -103,41 +100,59 @@ class RobloxAuditLogger(commands.Cog):
                     clean_cookie = clean_cookie.split(".ROBLOSECURITY=")[-1]
                 cookies = {".ROBLOSECURITY": clean_cookie}
 
-            timeout = aiohttp.ClientTimeout(total=5)
+            timeout = aiohttp.ClientTimeout(total=10)
             self.session = aiohttp.ClientSession(headers=headers, cookies=cookies, timeout=timeout)
         return self.session
 
     async def _safe_fetch_json(self, url: str, max_retries: int = 5) -> Optional[Dict[str, Any]]:
-        """Fetches JSON with up to 5 retries using exponential backoff."""
+        """Fetches JSON with exponential backoff for handling Roblox rate limits."""
         session = await self.get_http_session()
         for attempt in range(max_retries):
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    elif resp.status in [429, 500, 502, 503, 504]:
-                        await asyncio.sleep(0.3 * (2 ** attempt))
+                    elif resp.status == 429:
+                        # Back off longer when rate-limited
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    elif resp.status in [500, 502, 503, 504]:
+                        await asyncio.sleep(0.4 * (2 ** attempt))
                         continue
                     else:
                         return None
             except Exception:
                 if attempt == max_retries - 1:
                     return None
-                await asyncio.sleep(0.3 * (2 ** attempt))
+                await asyncio.sleep(0.4 * (2 ** attempt))
         return None
 
-    async def _fetch_all_group_members(self, group_id: int) -> tuple[Dict[str, Dict[str, Any]], bool]:
-        """Fetch group members with pagination. Safely bypasses errors if group roster is hidden/private."""
+    async def _fetch_group_roles(self, group_id: int) -> List[Dict[str, Any]]:
+        """Fetches roles and rank numbers for a group."""
         roles_url = f"https://groups.roblox.com/v1/groups/{group_id}/roles"
-        r_data = await self._safe_fetch_json(roles_url, max_retries=5)
-        if not r_data:
+        data = await self._safe_fetch_json(roles_url, max_retries=5)
+        if data and "roles" in data:
+            return data["roles"]
+        return []
+
+    async def _fetch_filtered_group_members(self, group_id: int, min_rank_val: int = 0) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        """
+        Fetch members only for roles that meet or exceed min_rank_val.
+        This prevents hitting rate limits on massive groups with 1,000+ lower-rank members.
+        """
+        roles = await self._fetch_group_roles(group_id)
+        if not roles:
             return {}, False
 
-        roles = r_data.get("roles", [])
+        # Filter roles to only fetch members at or above the required rank
+        target_roles = [r for r in roles if r.get("rank", 0) >= min_rank_val]
+        if not target_roles:
+            target_roles = roles
+
         member_map = {}
         all_pages_succeeded = True
 
-        for role in roles:
+        for role in target_roles:
             role_id = role.get("id")
             role_name = role.get("name")
             role_rank = role.get("rank")
@@ -151,7 +166,7 @@ class RobloxAuditLogger(commands.Cog):
                 if cursor:
                     members_url += f"&cursor={cursor}"
 
-                m_data = await self._safe_fetch_json(members_url, max_retries=5)
+                m_data = await self._safe_fetch_json(members_url, max_retries=3)
                 if m_data is None:
                     all_pages_succeeded = False
                     break
@@ -168,18 +183,23 @@ class RobloxAuditLogger(commands.Cog):
                 if not cursor:
                     break
                 
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)
 
         return member_map, all_pages_succeeded
 
-    async def _handle_setup(self, interaction: discord.Interaction, channel: discord.TextChannel, group_input: str, is_private: bool):
+    async def _handle_setup(
+        self, 
+        interaction: discord.Interaction, 
+        channel: discord.TextChannel, 
+        group_input: str, 
+        min_rank_name: Optional[str] = None
+    ):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
                 embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
                 ephemeral=True
             )
 
-        # Defer immediately to prevent timeout errors
         await interaction.response.defer(ephemeral=True)
 
         group_id = extract_group_id(group_input)
@@ -206,8 +226,33 @@ class RobloxAuditLogger(commands.Cog):
                 )
 
             group_name = group_data.get("name", f"Group {group_id}")
+            roles = await self._fetch_group_roles(group_id)
 
-            # Establish baseline watermark
+            min_rank_value = 0
+            selected_role_name = None
+
+            if min_rank_name:
+                matched_role = next(
+                    (r for r in roles if r.get("name", "").strip().lower() == min_rank_name.strip().lower()), 
+                    None
+                )
+                if not matched_role:
+                    role_list_str = "\n".join([f"• `{r.get('name')}` (Rank {r.get('rank')})" for r in roles])
+                    return await interaction.followup.send(
+                        embed=discord.Embed(
+                            title="❌ Rank Name Not Found",
+                            description=(
+                                f"Could not find a rank matching **`{min_rank_name}`** in **{group_name}**.\n\n"
+                                f"**Available Group Ranks:**\n{role_list_str}"
+                            ),
+                            color=RED_COLOR
+                        ),
+                        ephemeral=True
+                    )
+                min_rank_value = matched_role.get("rank", 0)
+                selected_role_name = matched_role.get("name")
+
+            # Watermark check
             audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
             session = await self.get_http_session()
             
@@ -235,13 +280,13 @@ class RobloxAuditLogger(commands.Cog):
                 "group_name": group_name,
                 "channel_id": str(channel.id),
                 "mode": mode,
-                "is_private": is_private,
+                "min_rank_name": selected_role_name,
+                "min_rank_value": min_rank_value,
                 "created_at": created_timestamp
             }
 
             if mode == "public_polling":
-                # Bypass restriction: attempt to fetch member cache; if hidden, initialize with empty dict so setup succeeds
-                initial_member_cache, success = await self._fetch_all_group_members(group_id)
+                initial_member_cache, success = await self._fetch_filtered_group_members(group_id, min_rank_value)
                 config_payload["member_cache"] = initial_member_cache if success else {}
             else:
                 config_payload["last_audit_id"] = last_audit_id
@@ -253,17 +298,16 @@ class RobloxAuditLogger(commands.Cog):
             )
 
             mode_msg = "Audit Log Stream (Cookie)" if mode == "audit_log" else "Public Polling Stream (Fallback)"
-            setup_title = "🔒 Private Roblox Logger Configured" if is_private else "✅ Roblox Group Logger Configured"
-            privacy_desc = "**Filter**: Logging **Promotions & Demotions ONLY** (User-Private Mode)\n" if is_private else ""
+            rank_filter_info = f"**Minimum Rank**: `{selected_role_name}` (Rank {min_rank_value}+)\n" if selected_role_name else "**Minimum Rank**: `All Ranks (0+)`\n"
 
             embed = discord.Embed(
-                title=setup_title,
+                title="✅ Roblox Group Logger Configured",
                 description=(
                     f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
                     f"**Group ID**: `{group_id}`\n"
                     f"**Channel**: {channel.mention}\n"
                     f"**Tracking Mode**: `{mode_msg}`\n"
-                    f"{privacy_desc}\n"
+                    f"{rank_filter_info}\n"
                     f"🟢 *Baseline watermark established. System is actively watching for events.*"
                 ),
                 color=GREEN_COLOR
@@ -282,7 +326,7 @@ class RobloxAuditLogger(commands.Cog):
 
     @app_commands.command(
         name="setup",
-        description="Setup Roblox Group activity logging (Authorized Owners Only)."
+        description="Setup Roblox Group activity logging for ALL ranks (Authorized Owners Only)."
     )
     @app_commands.describe(
         channel="The text channel where logs should be sent",
@@ -294,23 +338,25 @@ class RobloxAuditLogger(commands.Cog):
         channel: discord.TextChannel,
         group: str
     ):
-        await self._handle_setup(interaction, channel, group, is_private=False)
+        await self._handle_setup(interaction, channel, group, min_rank_name=None)
 
     @app_commands.command(
-        name="private-setup",
-        description="Setup private Roblox Group logging for Promotions ONLY (Authorized Owners Only)."
+        name="rank-setup",
+        description="Setup Roblox Group logging for a specific MINIMUM rank name and above."
     )
     @app_commands.describe(
         channel="The text channel where logs should be sent",
-        group="The Roblox Group ID or full Group Link to track"
+        group="The Roblox Group ID or full Group Link to track",
+        min_rank_name="The exact rank name to start logging from (e.g. Officer)"
     )
-    async def private_setup_cmd(
+    async def rank_setup_cmd(
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
-        group: str
+        group: str,
+        min_rank_name: str
     ):
-        await self._handle_setup(interaction, channel, group, is_private=True)
+        await self._handle_setup(interaction, channel, group, min_rank_name=min_rank_name)
 
     @app_commands.command(
         name="remove-setup",
@@ -358,8 +404,8 @@ class RobloxAuditLogger(commands.Cog):
             g_id = doc.get("group_id")
             ch_id = doc.get("channel_id")
             mode = doc.get("mode", "audit_log")
-            is_priv = "🔒 Private" if doc.get("is_private") else "🌐 Standard"
-            lines.append(f"• [{g_name}](https://www.roblox.com/groups/{g_id}) (`{g_id}`) ➔ <#{ch_id}> [{mode} | {is_priv}]")
+            min_r = doc.get("min_rank_name", "All")
+            lines.append(f"• [{g_name}](https://www.roblox.com/groups/{g_id}) (`{g_id}`) ➔ <#{ch_id}> [{mode} | Min Rank: {min_r}]")
 
         embed = discord.Embed(
             title="📋 Server Group Log Configurations",
@@ -369,10 +415,10 @@ class RobloxAuditLogger(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ====================================================================
-    # Background Poller Loop (~1.5s Interval)
+    # Background Poller Loop (~2.0s Interval)
     # ====================================================================
 
-    @tasks.loop(seconds=1.5)
+    @tasks.loop(seconds=2.0)
     async def poll_logs_task(self):
         await self.bot.wait_until_ready()
         try:
@@ -389,7 +435,7 @@ class RobloxAuditLogger(commands.Cog):
                 group_name = cfg.get("group_name", "Roblox Group")
                 channel_id = cfg.get("channel_id")
                 mode = cfg.get("mode", "audit_log")
-                is_private = cfg.get("is_private", False)
+                min_rank_val = cfg.get("min_rank_value", 0)
 
                 if not channel_id:
                     continue
@@ -399,17 +445,19 @@ class RobloxAuditLogger(commands.Cog):
                     continue
 
                 if mode == "audit_log":
-                    await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, is_private)
+                    await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
                 else:
-                    if self.cycle_count % 10 == 0:
-                        asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, is_private))
+                    # Stagger public polling cycles to prevent hitting limits on multiple large groups
+                    if self.cycle_count % 5 == 0:
+                        asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val))
 
         except Exception:
             pass
 
-    async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, is_private):
+    async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
         last_audit_id = cfg.get("last_audit_id")
-        url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=10"
+        url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
+        
         try:
             async with session.get(url) as resp:
                 if resp.status in [401, 403]:
@@ -437,17 +485,18 @@ class RobloxAuditLogger(commands.Cog):
                 if not new_logs:
                     return
 
+                # Update watermark to newest audit entry
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": new_logs[0]["id"]}})
 
                 for entry in reversed(new_logs):
-                    await self.send_formatted_log(channel, entry, group_id, group_name, is_private)
+                    await self.send_formatted_log(channel, entry, group_id, group_name, min_rank_val)
         except Exception:
             pass
 
-    async def poll_public_mode(self, db, cfg, channel, group_id, group_name, is_private):
+    async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val):
         cached_members = cfg.get("member_cache", {})
         try:
-            current_members, is_complete = await self._fetch_all_group_members(group_id)
+            current_members, is_complete = await self._fetch_filtered_group_members(group_id, min_rank_val)
             
             if not is_complete or not current_members:
                 return
@@ -456,18 +505,16 @@ class RobloxAuditLogger(commands.Cog):
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
                 return
 
-            if len(cached_members) > 20 and len(current_members) < (len(cached_members) * 0.85):
-                return
-
             now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
             for uid, info in current_members.items():
                 target_user = info["username"]
                 target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
-                
+                user_rank = info.get("rank", 0)
+
                 if uid not in cached_members:
-                    if not is_private:
+                    if user_rank >= min_rank_val:
                         embed = discord.Embed(
                             description=f"An individual has **joined the group**\n\n{target_user} has **joined the group**",
                             color=GREEN_COLOR
@@ -483,37 +530,37 @@ class RobloxAuditLogger(commands.Cog):
                             pass
                 else:
                     old_info = cached_members[uid]
+                    old_rank_num = old_info.get("rank", 0)
+
                     if old_info["role_name"] != info["role_name"]:
-                        old_rank_num = old_info.get("rank", 0)
-                        new_rank_num = info.get("rank", 0)
+                        if user_rank >= min_rank_val or old_rank_num >= min_rank_val:
+                            if user_rank < old_rank_num:
+                                header_title = "An individual has been **demoted**"
+                                sub_text = f"{target_user} has been **demoted**"
+                                color_side = ORANGE_COLOR
+                            else:
+                                header_title = "An individual has been **promoted**"
+                                sub_text = f"{target_user} has been **promoted**"
+                                color_side = GREEN_COLOR
 
-                        if new_rank_num < old_rank_num:
-                            header_title = "An individual has been **demoted**"
-                            sub_text = f"{target_user} has been **demoted**"
-                            color_side = ORANGE_COLOR
-                        else:
-                            header_title = "An individual has been **promoted**"
-                            sub_text = f"{target_user} has been **promoted**"
-                            color_side = GREEN_COLOR
+                            embed = discord.Embed(
+                                description=f"{header_title}\n\n{sub_text}",
+                                color=color_side
+                            )
+                            embed.add_field(name="User", value=target_link, inline=False)
+                            embed.add_field(name="Group", value=group_link, inline=False)
+                            embed.add_field(name="Old Rank", value=old_info["role_name"], inline=False)
+                            embed.add_field(name="New Rank", value=info["role_name"], inline=False)
+                            embed.add_field(name="\u200b", value=now_fmt, inline=False)
+                            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+                            try:
+                                await channel.send(embed=embed)
+                            except Exception:
+                                pass
 
-                        embed = discord.Embed(
-                            description=f"{header_title}\n\n{sub_text}",
-                            color=color_side
-                        )
-                        embed.add_field(name="User", value=target_link, inline=False)
-                        embed.add_field(name="Group", value=group_link, inline=False)
-                        embed.add_field(name="Old Rank", value=old_info["role_name"], inline=False)
-                        embed.add_field(name="New Rank", value=info["role_name"], inline=False)
-                        embed.add_field(name="\u200b", value=now_fmt, inline=False)
-                        embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
-                        try:
-                            await channel.send(embed=embed)
-                        except Exception:
-                            pass
-
-            if not is_private:
-                for uid, old_info in cached_members.items():
-                    if uid not in current_members:
+            for uid, old_info in cached_members.items():
+                if uid not in current_members:
+                    if old_info.get("rank", 0) >= min_rank_val:
                         target_user = old_info.get("username", f"User {uid}")
                         target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                         embed = discord.Embed(
@@ -535,7 +582,7 @@ class RobloxAuditLogger(commands.Cog):
         except Exception:
             pass
 
-    async def send_formatted_log(self, channel, entry, group_id, group_name, is_private: bool = False):
+    async def send_formatted_log(self, channel, entry, group_id, group_name, min_rank_val: int = 0):
         actor_data = entry.get("actor", {}).get("user", {})
         actor_name = actor_data.get("username", "System")
         actor_id = actor_data.get("userId")
@@ -561,6 +608,13 @@ class RobloxAuditLogger(commands.Cog):
 
             old_role = description.get("OldRoleSetHeader", description.get("OldRoleSetName", "Unknown"))
             new_role = description.get("NewRoleSetHeader", description.get("NewRoleSetName", "Unknown"))
+
+            roles = await self._fetch_group_roles(group_id)
+            new_rank_num = next((r.get("rank", 0) for r in roles if r.get("name") == new_role), 0)
+            old_rank_num = next((r.get("rank", 0) for r in roles if r.get("name") == old_role), 0)
+
+            if new_rank_num < min_rank_val and old_rank_num < min_rank_val:
+                return
 
             if action_type == "Demote Member":
                 header_title = "An individual has been **demoted**"
@@ -588,38 +642,58 @@ class RobloxAuditLogger(commands.Cog):
             except Exception:
                 pass
 
-        elif not is_private:
-            if action_type in ["Accept Join Request", "Join Group"]:
-                target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
-                target_id = description.get("TargetId", actor_id)
-                target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
+        elif action_type in ["Accept Join Request", "Join Group"]:
+            role_name = description.get("NewRoleSetHeader", description.get("RoleSetName", "Member"))
+            roles = await self._fetch_group_roles(group_id)
+            role_rank_num = next((r.get("rank", 0) for r in roles if r.get("name") == role_name), 0)
 
-                role_name = description.get("NewRoleSetHeader", description.get("RoleSetName", "Member"))
+            if role_rank_num < min_rank_val:
+                return
 
-                embed = discord.Embed(description=f"An individual has **joined the group**\n\n{target_user} has **joined the group**", color=GREEN_COLOR)
-                embed.add_field(name="User", value=target_link, inline=False)
-                embed.add_field(name="Group", value=group_link, inline=False)
-                embed.add_field(name="Rank", value=role_name, inline=False)
-                embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
-                embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+            target_user = description.get("TargetHeader", description.get("TargetName", actor_name))
+            target_id = description.get("TargetId", actor_id)
+            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
 
-            elif action_type == "Exil Member":
-                target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
-                target_id = description.get("TargetId")
-                target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
+            embed = discord.Embed(description=f"An individual has **joined the group**\n\n{target_user} has **joined the group**", color=GREEN_COLOR)
+            embed.add_field(name="User", value=target_link, inline=False)
+            embed.add_field(name="Group", value=group_link, inline=False)
+            embed.add_field(name="Rank", value=role_name, inline=False)
+            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
-                embed = discord.Embed(description=f"An individual has been **exiled**\n\n{target_user} has been **exiled**", color=RED_COLOR)
-                embed.add_field(name="User", value=target_link, inline=False)
-                embed.add_field(name="Group", value=group_link, inline=False)
-                embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
-                embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                pass
 
-            else:
-                embed = discord.Embed(description=f"An activity occurred in the group\n\n**Action**: `{action_type}`", color=BLUE_COLOR)
-                embed.add_field(name="Performer", value=f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else actor_name, inline=False)
-                embed.add_field(name="Group", value=group_link, inline=False)
-                embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
-                embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+        elif action_type == "Exil Member":
+            if min_rank_val > 0:
+                return
+
+            target_user = description.get("TargetHeader", description.get("TargetName", "Target User"))
+            target_id = description.get("TargetId")
+            target_link = f"[{target_user}](https://www.roblox.com/users/{target_id}/profile)" if target_id else f"**{target_user}**"
+
+            embed = discord.Embed(description=f"An individual has been **exiled**\n\n{target_user} has been **exiled**", color=RED_COLOR)
+            embed.add_field(name="User", value=target_link, inline=False)
+            embed.add_field(name="Group", value=group_link, inline=False)
+            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
+
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                pass
+
+        else:
+            if min_rank_val > 0:
+                return
+
+            embed = discord.Embed(description=f"An activity occurred in the group\n\n**Action**: `{action_type}`", color=BLUE_COLOR)
+            embed.add_field(name="Performer", value=f"[{actor_name}](https://www.roblox.com/users/{actor_id}/profile)" if actor_id else actor_name, inline=False)
+            embed.add_field(name="Group", value=group_link, inline=False)
+            embed.add_field(name="\u200b", value=timestamp_fmt, inline=False)
+            embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
 
             try:
                 await channel.send(embed=embed)
