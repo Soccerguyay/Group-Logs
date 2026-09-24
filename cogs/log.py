@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import asyncio
 import aiohttp
 import discord
@@ -65,17 +66,18 @@ class RobloxAuditLogger(commands.Cog):
     def cog_unload(self):
         self.poll_logs_task.cancel()
 
-    # Listener for when the bot is pinged/mentioned
+    # Listener for when the bot is pinged/mentioned (1 in 10 chance)
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
         
         if self.bot.user in message.mentions:
-            try:
-                await message.channel.send("Son why are you pinging me? \nMy job is to log not talking 😭✌️")
-            except Exception:
-                pass
+            if random.randint(1, 10) == 1:
+                try:
+                    await message.channel.send("Son why are you pinging me? \nMy job is to log not talking")
+                except Exception:
+                    pass
 
     async def get_http_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -184,7 +186,7 @@ class RobloxAuditLogger(commands.Cog):
     ):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
-                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
+                embed=discord.Embed(title="Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
                 ephemeral=True
             )
 
@@ -193,14 +195,14 @@ class RobloxAuditLogger(commands.Cog):
         group_id = extract_group_id(group_input)
         if not group_id:
             return await interaction.followup.send(
-                embed=discord.Embed(title="❌ Invalid Group Input", description="Please provide a valid numeric Group ID or a valid Roblox Group link.", color=RED_COLOR),
+                embed=discord.Embed(title="Invalid Group Input", description="Please provide a valid numeric Group ID or a valid Roblox Group link.", color=RED_COLOR),
                 ephemeral=True
             )
 
         db = get_db()
         if db is None:
             return await interaction.followup.send(
-                embed=discord.Embed(title="❌ Database Error", description="Could not connect to MongoDB Atlas.", color=RED_COLOR),
+                embed=discord.Embed(title="Database Error", description="Could not connect to MongoDB Atlas.", color=RED_COLOR),
                 ephemeral=True
             )
 
@@ -209,7 +211,7 @@ class RobloxAuditLogger(commands.Cog):
             group_data = await self._safe_fetch_json(group_url, max_retries=5)
             if not group_data:
                 return await interaction.followup.send(
-                    embed=discord.Embed(title="❌ Invalid Roblox Group", description=f"Group ID `{group_id}` could not be retrieved from Roblox.", color=RED_COLOR),
+                    embed=discord.Embed(title="Invalid Roblox Group", description=f"Group ID `{group_id}` could not be retrieved from Roblox.", color=RED_COLOR),
                     ephemeral=True
                 )
 
@@ -225,10 +227,10 @@ class RobloxAuditLogger(commands.Cog):
                     None
                 )
                 if not matched_role:
-                    role_list_str = "\n".join([f"• `{r.get('name')}` (Rank {r.get('rank')})" for r in roles])
+                    role_list_str = "\n".join([f"- `{r.get('name')}` (Rank {r.get('rank')})" for r in roles])
                     return await interaction.followup.send(
                         embed=discord.Embed(
-                            title="❌ Rank Name Not Found",
+                            title="Rank Name Not Found",
                             description=(
                                 f"Could not find a rank matching **`{min_rank_name}`** in **{group_name}**.\n\n"
                                 f"**Available Group Ranks:**\n{role_list_str}"
@@ -289,14 +291,14 @@ class RobloxAuditLogger(commands.Cog):
             rank_filter_info = f"**Minimum Rank**: `{selected_role_name}` (Rank {min_rank_value}+)\n" if selected_role_name else "**Minimum Rank**: `All Ranks (0+)`\n"
 
             embed = discord.Embed(
-                title="✅ Roblox Group Logger Configured",
+                title="Roblox Group Logger Configured",
                 description=(
                     f"**Group**: [{group_name}](https://www.roblox.com/groups/{group_id})\n"
                     f"**Group ID**: `{group_id}`\n"
                     f"**Channel**: {channel.mention}\n"
                     f"**Tracking Mode**: `{mode_msg}`\n"
                     f"{rank_filter_info}\n"
-                    f"🟢 *Baseline watermark established. System is actively watching for events.*"
+                    f"*Baseline watermark established. System is actively watching for events.*"
                 ),
                 color=GREEN_COLOR
             )
@@ -304,7 +306,7 @@ class RobloxAuditLogger(commands.Cog):
 
         except Exception as e:
             await interaction.followup.send(
-                embed=discord.Embed(title="❌ Setup Error", description=f"An unexpected error occurred: `{str(e)}`", color=RED_COLOR),
+                embed=discord.Embed(title="Setup Error", description=f"An unexpected error occurred: `{str(e)}`", color=RED_COLOR),
                 ephemeral=True
             )
 
@@ -319,37 +321,37 @@ class RobloxAuditLogger(commands.Cog):
     async def log_help_cmd(self, interaction: discord.Interaction):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
-                embed=discord.Embed(title="❌ Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
+                embed=discord.Embed(title="Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
                 ephemeral=True
             )
 
         embed = discord.Embed(
-            title="📖 Roblox Group Logger - Usage & Optimization Guide",
+            title="Roblox Group Logger - Usage & Optimization Guide",
             description="Use the commands below to configure and monitor Roblox group audit events.",
             color=BLUE_COLOR
         )
 
         embed.add_field(
-            name="🛠️ Available Commands",
+            name="Available Commands",
             value=(
-                "• **/setup `[channel]` `[group]`**\n"
+                "- **/setup `[channel]` `[group]`**\n"
                 "  Tracks all events for all ranks in the group.\n\n"
-                "• **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
+                "- **/rank-setup `[channel]` `[group]` `[min_rank_name]`**\n"
                 "  Tracks events exclusively for members at or above a specific rank.\n\n"
-                "• **/remove-setup `[group]`**\n"
+                "- **/remove-setup `[group]`**\n"
                 "  Stops logging for a specific group.\n\n"
-                "• **/list-setups**\n"
+                "- **/list-setups**\n"
                 "  Displays all configured group logs in this server."
             ),
             inline=False
         )
 
         embed.add_field(
-            name="💡 Optimization Advice (Large Groups 1,000+ Members)",
+            name="Optimization Advice (Large Groups 1,000+ Members)",
             value=(
-                "• **Avoid using `/setup` on massive groups** without a cookie attached. Fetching thousands of bottom-rank members triggers Roblox API rate limits.\n"
-                "• **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff or middle-tier rank (or a low rank that doesn't constantly change).\n"
-                "• **Case-Insensitive Exact Names**: When entering `min_rank_name`, type the exact rank title as shown on Roblox."
+                "- **Avoid using `/setup` on massive groups** without a cookie attached. Fetching thousands of bottom-rank members triggers Roblox API rate limits.\n"
+                "- **Use `/rank-setup` instead**: Set `min_rank_name` to a stable staff or middle-tier rank (or a low rank that doesn't constantly change).\n"
+                "- **Case-Insensitive Exact Names**: When entering `min_rank_name`, type the exact rank title as shown on Roblox."
             ),
             inline=False
         )
@@ -397,23 +399,23 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def remove_setup_cmd(self, interaction: discord.Interaction, group: str):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title=" Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
         group_id = extract_group_id(group)
         if not group_id:
-            return await interaction.followup.send(embed=discord.Embed(title=" Invalid Group Input", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Invalid Group Input", color=RED_COLOR), ephemeral=True)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title=" Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=True)
 
         res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.followup.send(embed=discord.Embed(title=" Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title="Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
         else:
-            await interaction.followup.send(embed=discord.Embed(title=" Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title="Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
 
     @app_commands.command(
         name="list-setups",
@@ -421,13 +423,13 @@ class RobloxAuditLogger(commands.Cog):
     )
     async def list_setups_cmd(self, interaction: discord.Interaction):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title=" Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title=" Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=True)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
         configs = await cursor.to_list(length=100)
@@ -438,10 +440,10 @@ class RobloxAuditLogger(commands.Cog):
             ch_id = doc.get("channel_id")
             mode = doc.get("mode", "audit_log")
             min_r = doc.get("min_rank_name", "All")
-            lines.append(f"• [{g_name}](https://www.roblox.com/groups/{g_id}) (`{g_id}`) ➔ <#{ch_id}> [{mode} | Min Rank: {min_r}]")
+            lines.append(f"- [{g_name}](https://www.roblox.com/groups/{g_id}) (`{g_id}`) -> <#{ch_id}> [{mode} | Min Rank: {min_r}]")
 
         embed = discord.Embed(
-            title="📋 Server Group Log Configurations",
+            title="Server Group Log Configurations",
             description="\n".join(lines) if lines else "*(No active group setups)*",
             color=BLUE_COLOR
         )
