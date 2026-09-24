@@ -129,10 +129,6 @@ class RobloxAuditLogger(commands.Cog):
         return []
 
     async def _fetch_filtered_group_members(self, group_id: int, min_rank_val: int = 0) -> tuple[Dict[str, Dict[str, Any]], bool]:
-        """
-        Fetch members only for roles that meet or exceed min_rank_val.
-        This prevents hitting rate limits on massive groups with 1,000+ lower-rank members.
-        """
         roles = await self._fetch_group_roles(group_id)
         if not roles:
             return {}, False
@@ -184,28 +180,31 @@ class RobloxAuditLogger(commands.Cog):
         interaction: discord.Interaction, 
         channel: discord.TextChannel, 
         group_input: str, 
-        min_rank_name: Optional[str] = None
+        min_rank_name: Optional[str] = None,
+        visible: bool = False
     ):
+        is_ephemeral = not visible
+
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
                 embed=discord.Embed(title="Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
-                ephemeral=True
+                ephemeral=is_ephemeral
             )
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=is_ephemeral)
 
         group_id = extract_group_id(group_input)
         if not group_id:
             return await interaction.followup.send(
                 embed=discord.Embed(title="Invalid Group Input", description="Please provide a valid numeric Group ID or a valid Roblox Group link.", color=RED_COLOR),
-                ephemeral=True
+                ephemeral=is_ephemeral
             )
 
         db = get_db()
         if db is None:
             return await interaction.followup.send(
                 embed=discord.Embed(title="Database Error", description="Could not connect to MongoDB Atlas.", color=RED_COLOR),
-                ephemeral=True
+                ephemeral=is_ephemeral
             )
 
         try:
@@ -214,7 +213,7 @@ class RobloxAuditLogger(commands.Cog):
             if not group_data:
                 return await interaction.followup.send(
                     embed=discord.Embed(title="Invalid Roblox Group", description=f"Group ID `{group_id}` could not be retrieved from Roblox.", color=RED_COLOR),
-                    ephemeral=True
+                    ephemeral=is_ephemeral
                 )
 
             group_name = group_data.get("name", f"Group {group_id}")
@@ -239,12 +238,11 @@ class RobloxAuditLogger(commands.Cog):
                             ),
                             color=RED_COLOR
                         ),
-                        ephemeral=True
+                        ephemeral=is_ephemeral
                     )
                 min_rank_value = matched_role.get("rank", 0)
                 selected_role_name = matched_role.get("name")
 
-            # Watermark check
             audit_url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=1"
             session = await self.get_http_session()
             
@@ -304,12 +302,12 @@ class RobloxAuditLogger(commands.Cog):
                 ),
                 color=GREEN_COLOR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=is_ephemeral)
 
         except Exception as e:
             await interaction.followup.send(
                 embed=discord.Embed(title="Setup Error", description=f"An unexpected error occurred: `{str(e)}`", color=RED_COLOR),
-                ephemeral=True
+                ephemeral=is_ephemeral
             )
 
     # ====================================================================
@@ -320,16 +318,15 @@ class RobloxAuditLogger(commands.Cog):
         name="ping",
         description="View system latency, uptime, database status, and tracking overview."
     )
-    async def ping_cmd(self, interaction: discord.Interaction):
+    @app_commands.describe(visible="Set to True to make the response visible to everyone (default: False).")
+    async def ping_cmd(self, interaction: discord.Interaction, visible: bool = False):
         start_time = time.perf_counter()
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not visible)
         end_time = time.perf_counter()
 
-        # Calculate Latencies
         response_ms = round((end_time - start_time) * 1000)
         gateway_ms = round(self.bot.latency * 1000)
 
-        # Database Check
         db = get_db()
         db_status = "Disconnected"
         db_ms_str = "N/A"
@@ -347,7 +344,6 @@ class RobloxAuditLogger(commands.Cog):
             except Exception:
                 db_status = "Error"
 
-        # Calculate Uptime
         now = datetime.now(timezone.utc)
         uptime_delta = now - self.start_time
         hours, remainder = divmod(int(uptime_delta.total_seconds()), 3600)
@@ -363,47 +359,48 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="Latency",
+            name="## Latency",
             value=(
-                f"**Gateway Ping**: `{gateway_ms} ms`\n"
-                f"**Response Time**: `{response_ms} ms`\n"
-                f"**Database Latency**: `{db_ms_str}`"
+                f"Gateway Ping: `{gateway_ms} ms`\n"
+                f"Response Time: `{response_ms} ms`\n"
+                f"Database Latency: `{db_ms_str}`"
             ),
             inline=True
         )
 
         embed.add_field(
-            name="System Health",
+            name="## System Health",
             value=(
-                f"**Database**: `{db_status}`\n"
-                f"**Uptime**: `{uptime_str}`\n"
-                f"**Poll Cycles**: `{self.cycle_count}`"
+                f"Database: `{db_status}`\n"
+                f"Uptime: `{uptime_str}`\n"
+                f"Poll Cycles: `{self.cycle_count}`"
             ),
             inline=True
         )
 
         embed.add_field(
-            name="Tracking Stats",
+            name="## Tracking Stats",
             value=(
-                f"**Tracked Groups**: `{total_groups}`\n"
-                f"**Total Servers**: `{len(self.bot.guilds)}`\n"
-                f"**WebSocket Status**: `Connected`"
+                f"Tracked Groups: `{total_groups}`\n"
+                f"Total Servers: `{len(self.bot.guilds)}`\n"
+                f"WebSocket Status: `Connected`"
             ),
             inline=False
         )
 
         embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
         name="log-help",
         description="View commands, usage guides, and recommended settings for optimal performance."
     )
-    async def log_help_cmd(self, interaction: discord.Interaction):
+    @app_commands.describe(visible="Set to True to make the response visible to everyone (default: False).")
+    async def log_help_cmd(self, interaction: discord.Interaction, visible: bool = False):
         if not is_authorized_user(interaction.user.id):
             return await interaction.response.send_message(
                 embed=discord.Embed(title="Permission Denied", description="You are not authorized to use this command.", color=RED_COLOR),
-                ephemeral=True
+                ephemeral=not visible
             )
 
         embed = discord.Embed(
@@ -440,7 +437,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=not visible)
 
     @app_commands.command(
         name="setup",
@@ -448,15 +445,17 @@ class RobloxAuditLogger(commands.Cog):
     )
     @app_commands.describe(
         channel="The text channel where logs should be sent",
-        group="The Roblox Group ID or full Group Link to track"
+        group="The Roblox Group ID or full Group Link to track",
+        visible="Set to True to make the response visible to everyone (default: False)."
     )
     async def setup_cmd(
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
-        group: str
+        group: str,
+        visible: bool = False
     ):
-        await self._handle_setup(interaction, channel, group, min_rank_name=None)
+        await self._handle_setup(interaction, channel, group, min_rank_name=None, visible=visible)
 
     @app_commands.command(
         name="rank-setup",
@@ -465,54 +464,61 @@ class RobloxAuditLogger(commands.Cog):
     @app_commands.describe(
         channel="The text channel where logs should be sent",
         group="The Roblox Group ID or full Group Link to track",
-        min_rank_name="The exact rank name to start logging from (e.g. Officer)"
+        min_rank_name="The exact rank name to start logging from (e.g. Officer)",
+        visible="Set to True to make the response visible to everyone (default: False)."
     )
     async def rank_setup_cmd(
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel,
         group: str,
-        min_rank_name: str
+        min_rank_name: str,
+        visible: bool = False
     ):
-        await self._handle_setup(interaction, channel, group, min_rank_name=min_rank_name)
+        await self._handle_setup(interaction, channel, group, min_rank_name=min_rank_name, visible=visible)
 
     @app_commands.command(
         name="remove-setup",
         description="Remove a Roblox Group audit setup from this server (Authorized Owners Only)."
     )
-    async def remove_setup_cmd(self, interaction: discord.Interaction, group: str):
+    @app_commands.describe(
+        group="The Roblox Group ID or full Group Link to untrack",
+        visible="Set to True to make the response visible to everyone (default: False)."
+    )
+    async def remove_setup_cmd(self, interaction: discord.Interaction, group: str, visible: bool = False):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=not visible)
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not visible)
 
         group_id = extract_group_id(group)
         if not group_id:
-            return await interaction.followup.send(embed=discord.Embed(title="Invalid Group Input", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Invalid Group Input", color=RED_COLOR), ephemeral=not visible)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=not visible)
 
         res = await db["group_configs"].delete_one({"guild_id": str(interaction.guild.id), "group_id": group_id})
         if res.deleted_count > 0:
-            await interaction.followup.send(embed=discord.Embed(title="Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title="Setup Removed", description=f"Stopped tracking Group ID `{group_id}`.", color=GREEN_COLOR), ephemeral=not visible)
         else:
-            await interaction.followup.send(embed=discord.Embed(title="Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=True)
+            await interaction.followup.send(embed=discord.Embed(title="Not Found", description=f"No configuration found for Group ID `{group_id}`.", color=RED_COLOR), ephemeral=not visible)
 
     @app_commands.command(
         name="list-setups",
         description="List active group configurations (Authorized Owners Only)."
     )
-    async def list_setups_cmd(self, interaction: discord.Interaction):
+    @app_commands.describe(visible="Set to True to make the response visible to everyone (default: False).")
+    async def list_setups_cmd(self, interaction: discord.Interaction, visible: bool = False):
         if not is_authorized_user(interaction.user.id):
-            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=True)
+            return await interaction.response.send_message(embed=discord.Embed(title="Permission Denied", color=RED_COLOR), ephemeral=not visible)
 
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=not visible)
 
         db = get_db()
         if db is None:
-            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=True)
+            return await interaction.followup.send(embed=discord.Embed(title="Database Error", color=RED_COLOR), ephemeral=not visible)
 
         cursor = db["group_configs"].find({"guild_id": str(interaction.guild.id)})
         configs = await cursor.to_list(length=100)
@@ -530,7 +536,7 @@ class RobloxAuditLogger(commands.Cog):
             description="\n".join(lines) if lines else "*(No active group setups)*",
             color=BLUE_COLOR
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     # ====================================================================
     # Background Poller Loop (~2.0s Interval)
