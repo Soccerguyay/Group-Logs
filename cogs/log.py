@@ -359,7 +359,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="## Latency",
+            name="Latency",
             value=(
                 f"Gateway Ping: `{gateway_ms} ms`\n"
                 f"Response Time: `{response_ms} ms`\n"
@@ -369,7 +369,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="## System Health",
+            name="System Health",
             value=(
                 f"Database: `{db_status}`\n"
                 f"Uptime: `{uptime_str}`\n"
@@ -379,7 +379,7 @@ class RobloxAuditLogger(commands.Cog):
         )
 
         embed.add_field(
-            name="## Tracking Stats",
+            name="Tracking Stats",
             value=(
                 f"Tracked Groups: `{total_groups}`\n"
                 f"Total Servers: `{len(self.bot.guilds)}`\n"
