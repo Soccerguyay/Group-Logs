@@ -24,6 +24,7 @@ BLUE_COLOR = discord.Color.from_rgb(41, 128, 185)
 
 _mongo_client = None
 
+
 def get_db():
     global _mongo_client
     mongo_uri = os.getenv("MONGO_URI")
@@ -42,8 +43,10 @@ def get_db():
     except Exception:
         return None
 
+
 def is_authorized_user(user_id: int) -> bool:
     return user_id in AUTHORIZED_USER_IDS
+
 
 def extract_group_id(input_val: str) -> Optional[int]:
     """Extracts group ID from plain integer string or Roblox group URL."""
@@ -57,6 +60,44 @@ def extract_group_id(input_val: str) -> Optional[int]:
     return None
 
 
+# ==========================================
+# DYNAMIC POLLING TRACKER (OPTIMIZED)
+# ==========================================
+class GroupTracker:
+    """Tracks polling intervals individually for each group to optimize bandwidth."""
+    def __init__(self, group_id: int):
+        self.group_id = group_id
+        self.last_polled: float = 0.0
+        self.last_changed: float = time.time()
+        self.current_interval: int = 300  # Default 5-minute loop (300s)
+
+    def update_interval(self, has_changes: bool):
+        now = time.time()
+        self.last_polled = now
+
+        if has_changes:
+            # Reset to 5-minute active polling immediately when a change occurs
+            self.last_changed = now
+            self.current_interval = 300
+            return
+
+        quiet_duration = now - self.last_changed
+
+        # Dynamic scaling based on activity level to preserve bandwidth
+        if quiet_duration > 3600:     # Quiet > 1 hour -> Poll every 9 mins (540s)
+            self.current_interval = 540
+        elif quiet_duration > 1800:   # Quiet > 30 mins -> Poll every 7 mins (420s)
+            self.current_interval = 420
+        else:                         # Active -> Poll every 5 mins (300s)
+            self.current_interval = 300
+
+    def is_due(self) -> bool:
+        return (time.time() - self.last_polled) >= self.current_interval
+
+
+# ==========================================
+# MAIN COG
+# ==========================================
 class RobloxAuditLogger(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -64,6 +105,7 @@ class RobloxAuditLogger(commands.Cog):
         self.cycle_count: int = 0
         self.start_time: datetime = datetime.now(timezone.utc)
         self.roles_cache: Dict[int, Dict[str, Any]] = {}  # {group_id: {"timestamp": float, "roles": list}}
+        self.group_trackers: Dict[int, GroupTracker] = {}
         self.poll_logs_task.start()
 
     def cog_unload(self):
@@ -552,10 +594,10 @@ class RobloxAuditLogger(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=not visible)
 
     # ====================================================================
-    # Background Poller Loop (~30.0s Interval to save bandwidth)
+    # Background Poller Loop (Dynamic Group-Level Check Intervals)
     # ====================================================================
 
-    @tasks.loop(seconds=30.0)
+    @tasks.loop(seconds=10.0)
     async def poll_logs_task(self):
         await self.bot.wait_until_ready()
         try:
@@ -574,19 +616,27 @@ class RobloxAuditLogger(commands.Cog):
                 mode = cfg.get("mode", "audit_log")
                 min_rank_val = cfg.get("min_rank_value", 0)
 
-                if not channel_id:
+                if not channel_id or not group_id:
                     continue
 
                 channel = self.bot.get_channel(int(channel_id))
                 if not channel:
                     continue
 
+                # Ensure dynamic tracking exists for this specific group
+                if group_id not in self.group_trackers:
+                    self.group_trackers[group_id] = GroupTracker(group_id)
+
+                tracker = self.group_trackers[group_id]
+
                 if mode == "audit_log":
                     await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
                 else:
-                    # Execute public polling only every 10 cycles (~5 minutes)
-                    if self.cycle_count % 10 == 0:
-                        asyncio.create_task(self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val))
+                    # Execute public polling only when this group is due according to its tracker
+                    if tracker.is_due():
+                        asyncio.create_task(
+                            self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val, tracker)
+                        )
 
         except Exception:
             pass
@@ -629,28 +679,42 @@ class RobloxAuditLogger(commands.Cog):
         except Exception:
             pass
 
-    async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val):
+    async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val, tracker: GroupTracker):
         cached_members = cfg.get("member_cache", {})
+        has_changes = False
+
         try:
             current_members, is_complete = await self._fetch_filtered_group_members(group_id, min_rank_val)
             
+            # If fetch failed or came back incomplete, exit without comparing
             if not is_complete or not current_members:
+                tracker.update_interval(False)
                 return
 
+            # Establish initial baseline
             if not cached_members:
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+                tracker.update_interval(False)
                 return
 
             now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
             group_link = f"[{group_name}](https://www.roblox.com/groups/{group_id})"
 
+            # Working local dict to modify and write back to MongoDB
+            updated_cache = dict(cached_members)
+
+            # 1. CHECK FOR NEW JOINS & RANK CHANGES
             for uid, info in current_members.items():
                 target_user = info["username"]
                 target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                 user_rank = info.get("rank", 0)
 
+                # NEW JOIN
                 if uid not in cached_members:
                     if user_rank >= min_rank_val:
+                        has_changes = True
+                        updated_cache[uid] = info
+
                         embed = discord.Embed(
                             description=f"An individual has **joined the group**\n\n{target_user} has **joined the group**",
                             color=GREEN_COLOR
@@ -664,12 +728,17 @@ class RobloxAuditLogger(commands.Cog):
                             await channel.send(embed=embed)
                         except Exception:
                             pass
+
+                # RANK CHANGE (Promotion / Demotion)
                 else:
                     old_info = cached_members[uid]
                     old_rank_num = old_info.get("rank", 0)
 
-                    if old_info["role_name"] != info["role_name"]:
+                    if old_info.get("role_name") != info.get("role_name"):
                         if user_rank >= min_rank_val or old_rank_num >= min_rank_val:
+                            has_changes = True
+                            updated_cache[uid] = info
+
                             if user_rank < old_rank_num:
                                 header_title = "An individual has been **demoted**"
                                 sub_text = f"{target_user} has been **demoted**"
@@ -685,7 +754,7 @@ class RobloxAuditLogger(commands.Cog):
                             )
                             embed.add_field(name="User", value=target_link, inline=False)
                             embed.add_field(name="Group", value=group_link, inline=False)
-                            embed.add_field(name="Old Rank", value=old_info["role_name"], inline=False)
+                            embed.add_field(name="Old Rank", value=old_info.get("role_name", "Unknown"), inline=False)
                             embed.add_field(name="New Rank", value=info["role_name"], inline=False)
                             embed.add_field(name="\u200b", value=now_fmt, inline=False)
                             embed.set_footer(text=self.bot.user.name if self.bot.user else "TGE Logs Bot")
@@ -694,9 +763,13 @@ class RobloxAuditLogger(commands.Cog):
                             except Exception:
                                 pass
 
-            for uid, old_info in cached_members.items():
+            # 2. CHECK FOR LEAVES / EXILES
+            for uid, old_info in list(cached_members.items()):
                 if uid not in current_members:
                     if old_info.get("rank", 0) >= min_rank_val:
+                        has_changes = True
+                        updated_cache.pop(uid, None)
+
                         target_user = old_info.get("username", f"User {uid}")
                         target_link = f"[{target_user}](https://www.roblox.com/users/{uid}/profile)"
                         embed = discord.Embed(
@@ -713,10 +786,13 @@ class RobloxAuditLogger(commands.Cog):
                         except Exception:
                             pass
 
-            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+            # Save updated working cache back to database
+            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
 
         except Exception:
             pass
+        finally:
+            tracker.update_interval(has_changes)
 
     async def send_formatted_log(self, channel, entry, group_id, group_name, min_rank_val: int = 0):
         actor_data = entry.get("actor", {}).get("user", {})
@@ -802,7 +878,7 @@ class RobloxAuditLogger(commands.Cog):
             except Exception:
                 pass
 
-        elif action_type == "Exil Member":
+        elif action_type in ["Remove Member", "Exile Member"]:
             if min_rank_val > 0:
                 return
 
@@ -838,4 +914,4 @@ class RobloxAuditLogger(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(groupLogs(bot))
+    await bot.add_cog(RobloxAuditLogger(bot))
