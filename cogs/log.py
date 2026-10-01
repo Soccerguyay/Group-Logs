@@ -106,6 +106,7 @@ class RobloxAuditLogger(commands.Cog):
         self.start_time: datetime = datetime.now(timezone.utc)
         self.roles_cache: Dict[int, Dict[str, Any]] = {}  # {group_id: {"timestamp": float, "roles": list}}
         self.group_trackers: Dict[int, GroupTracker] = {}
+        self.initialized_groups: set = set()  # Set of group_ids synced since this bot instance started
         self.poll_logs_task.start()
 
     def cog_unload(self):
@@ -341,6 +342,9 @@ class RobloxAuditLogger(commands.Cog):
                 {"$set": config_payload},
                 upsert=True
             )
+
+            # Mark group as initialized so deployment sync isn't required for fresh setups
+            self.initialized_groups.add(group_id)
 
             mode_msg = "Audit Log Stream (Cookie)" if mode == "audit_log" else "Public Polling Stream (Fallback)"
             rank_filter_info = f"**Minimum Rank**: `{selected_role_name}` (Rank {min_rank_value}+)\n" if selected_role_name else "**Minimum Rank**: `All Ranks (0+)`\n"
@@ -642,7 +646,6 @@ class RobloxAuditLogger(commands.Cog):
             pass
 
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
-        last_audit_id = cfg.get("last_audit_id")
         url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
         
         try:
@@ -659,10 +662,16 @@ class RobloxAuditLogger(commands.Cog):
                 if not logs:
                     return
 
-                if last_audit_id is None:
-                    await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": logs[0].get("id")}})
+                latest_id = logs[0].get("id")
+
+                # RE-DEPLOYMENT / INITIAL STARTUP SYNC:
+                # If group hasn't been initialized during this runtime session, sync latest audit ID without logging past entries.
+                if group_id not in self.initialized_groups or cfg.get("last_audit_id") is None:
+                    await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": latest_id}})
+                    self.initialized_groups.add(group_id)
                     return
 
+                last_audit_id = cfg.get("last_audit_id")
                 new_logs = []
                 for item in logs:
                     if item.get("id") == last_audit_id:
@@ -691,9 +700,11 @@ class RobloxAuditLogger(commands.Cog):
                 tracker.update_interval(False)
                 return
 
-            # Establish initial baseline
-            if not cached_members:
+            # RE-DEPLOYMENT / INITIAL STARTUP SYNC:
+            # Silently refresh the local baseline member cache on restart to prevent logging offline changes.
+            if group_id not in self.initialized_groups or not cached_members:
                 await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
+                self.initialized_groups.add(group_id)
                 tracker.update_interval(False)
                 return
 
