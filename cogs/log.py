@@ -2,6 +2,7 @@ import os
 import re
 import time
 import random
+import logging
 import asyncio
 import aiohttp
 import discord
@@ -22,6 +23,8 @@ ORANGE_COLOR = discord.Color.from_rgb(211, 84, 0)
 RED_COLOR = discord.Color.from_rgb(192, 57, 43)
 BLUE_COLOR = discord.Color.from_rgb(41, 128, 185)
 
+log = logging.getLogger("roblox_audit")
+
 _mongo_client = None
 
 
@@ -33,8 +36,10 @@ def get_db():
     if _mongo_client is None:
         try:
             _mongo_client = motor.motor_asyncio.AsyncIOMotorClient(
-                mongo_uri, 
-                serverSelectionTimeoutMS=2000
+                mongo_uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=20000,
             )
         except Exception:
             return None
@@ -107,10 +112,18 @@ class RobloxAuditLogger(commands.Cog):
         self.roles_cache: Dict[int, Dict[str, Any]] = {}  # {group_id: {"timestamp": float, "roles": list}}
         self.group_trackers: Dict[int, GroupTracker] = {}
         self.initialized_groups: set = set()  # Set of group_ids synced since this bot instance started
+        self.public_tasks: Dict[Any, asyncio.Task] = {}  # One running public-poll task per config
+        self.last_cycle_at: float = time.time()  # Heartbeat: updated after every poll cycle
         self.poll_logs_task.start()
+        self.watchdog_task.start()
 
-    def cog_unload(self):
+    async def cog_unload(self):
         self.poll_logs_task.cancel()
+        self.watchdog_task.cancel()
+        for task in list(self.public_tasks.values()):
+            task.cancel()
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     # Listener for when the bot is pinged/mentioned (1 in 10 chance)
     @commands.Cog.listener()
@@ -603,47 +616,96 @@ class RobloxAuditLogger(commands.Cog):
 
     @tasks.loop(seconds=10.0)
     async def poll_logs_task(self):
-        await self.bot.wait_until_ready()
         try:
-            db = get_db()
-            if db is None:
-                return
-
-            session = await self.get_http_session()
-            configs = await db["group_configs"].find().to_list(length=1000)
-            self.cycle_count += 1
-
-            for cfg in configs:
-                group_id = cfg.get("group_id")
-                group_name = cfg.get("group_name", "Roblox Group")
-                channel_id = cfg.get("channel_id")
-                mode = cfg.get("mode", "audit_log")
-                min_rank_val = cfg.get("min_rank_value", 0)
-
-                if not channel_id or not group_id:
-                    continue
-
-                channel = self.bot.get_channel(int(channel_id))
-                if not channel:
-                    continue
-
-                # Ensure dynamic tracking exists for this specific group
-                if group_id not in self.group_trackers:
-                    self.group_trackers[group_id] = GroupTracker(group_id)
-
-                tracker = self.group_trackers[group_id]
-
-                if mode == "audit_log":
-                    await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
-                else:
-                    # Execute public polling only when this group is due according to its tracker
-                    if tracker.is_due():
-                        asyncio.create_task(
-                            self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val, tracker)
-                        )
-
+            await asyncio.wait_for(self._poll_cycle(), timeout=120)
+        except asyncio.TimeoutError:
+            log.warning("Poll cycle took longer than 120s and was cancelled. Continuing.")
         except Exception:
-            pass
+            log.exception("Poll cycle failed. Will retry on the next tick.")
+        finally:
+            self.last_cycle_at = time.time()
+
+    @poll_logs_task.before_loop
+    async def before_poll_logs_task(self):
+        await self.bot.wait_until_ready()
+        self.last_cycle_at = time.time()
+
+    @tasks.loop(seconds=60.0)
+    async def watchdog_task(self):
+        """Restarts the poll loop if it stopped or got stuck."""
+        try:
+            if not self.poll_logs_task.is_running():
+                log.error("Poll loop was not running. Starting it again.")
+                self.poll_logs_task.start()
+            elif time.time() - self.last_cycle_at > 180:
+                log.error("Poll loop looks stuck (no cycle for 180s). Restarting it.")
+                self.poll_logs_task.restart()
+        except Exception:
+            log.exception("Watchdog failed")
+
+    @watchdog_task.before_loop
+    async def before_watchdog_task(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(90)
+
+    async def _poll_cycle(self):
+        db = get_db()
+        if db is None:
+            return
+
+        session = await self.get_http_session()
+        configs = await db["group_configs"].find().to_list(length=1000)
+        self.cycle_count += 1
+
+        for cfg in configs:
+            # One bad group must never stop the others
+            try:
+                await self._poll_one(db, session, cfg)
+            except Exception:
+                log.exception("Polling failed for group %s", cfg.get("group_id"))
+
+    async def _poll_one(self, db, session, cfg):
+        group_id = cfg.get("group_id")
+        group_name = cfg.get("group_name", "Roblox Group")
+        channel_id = cfg.get("channel_id")
+        mode = cfg.get("mode", "audit_log")
+        min_rank_val = cfg.get("min_rank_value", 0)
+
+        if not channel_id or not group_id:
+            return
+
+        channel = self.bot.get_channel(int(channel_id))
+        if not channel:
+            return
+
+        # Trackers are per config (a group can be set up in more than one server)
+        key = cfg["_id"]
+        tracker = self.group_trackers.get(key)
+        if tracker is None:
+            tracker = self.group_trackers[key] = GroupTracker(group_id)
+
+        if mode == "audit_log":
+            await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
+            return
+
+        # Public polling: only when due, and never two at once for the same config
+        if key in self.public_tasks or not tracker.is_due():
+            return
+
+        tracker.last_polled = time.time()  # Claim this slot now so the next 10s tick does not start a duplicate
+        task = asyncio.create_task(
+            self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val, tracker)
+        )
+        self.public_tasks[key] = task  # Keep a reference so the task is not garbage collected
+        task.add_done_callback(lambda t, k=key: self._on_public_task_done(k, t))
+
+    def _on_public_task_done(self, key, task: asyncio.Task):
+        self.public_tasks.pop(key, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            log.error("Public poll task crashed", exc_info=exc)
 
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
         url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
@@ -651,6 +713,7 @@ class RobloxAuditLogger(commands.Cog):
         try:
             async with session.get(url) as resp:
                 if resp.status in [401, 403]:
+                    log.warning("Audit log returned %s for group %s. Switching it to public polling.", resp.status, group_id)
                     await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
                     return
 
@@ -686,7 +749,7 @@ class RobloxAuditLogger(commands.Cog):
                 for entry in reversed(new_logs):
                     await self.send_formatted_log(channel, entry, group_id, group_name, min_rank_val)
         except Exception:
-            pass
+            log.exception("Audit log polling failed for group %s", group_id)
 
     async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val, tracker: GroupTracker):
         cached_members = cfg.get("member_cache", {})
@@ -801,7 +864,7 @@ class RobloxAuditLogger(commands.Cog):
             await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
 
         except Exception:
-            pass
+            log.exception("Public polling failed for group %s", group_id)
         finally:
             tracker.update_interval(has_changes)
 
