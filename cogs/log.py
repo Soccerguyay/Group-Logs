@@ -53,6 +53,12 @@ EMBED_SEND_BYTES = 3000        # Estimated size of one Discord embed message
 CONFIG_REFRESH_SECONDS = 60    # How often saved setups are re-read from MongoDB
 USAGE_FLUSH_SECONDS = 600      # How often the usage counter is saved to MongoDB
 
+# --- Roblox rate-limit protection ----------------------------------------
+ROBLOX_MIN_GAP = 0.35          # Seconds between any two Roblox requests (all groups share one queue)
+ROBLOX_PENALTY_START = 10.0    # First pause (seconds) when Roblox answers 429 ...
+ROBLOX_PENALTY_MAX = 120.0     # ... doubling each time up to this
+PUBLIC_POLL_CONCURRENCY = 1    # Public-polling groups are checked one at a time
+
 # The saved setups are scanned without any old saved member list (rosters live in memory only)
 CONFIG_PROJECTION = {"member_cache": 0}
 
@@ -253,6 +259,10 @@ class RobloxAuditLogger(commands.Cog):
         self.usage_flushed_at: float = 0.0
         self.cleaned_old_rosters: bool = False
         self.guard_state: str = "normal"
+        self._roblox_next_at: float = 0.0                     # earliest time for the next Roblox request
+        self._roblox_blocked_until: float = 0.0               # pause everything until then after a 429
+        self._roblox_penalty: float = ROBLOX_PENALTY_START
+        self._public_sem = asyncio.Semaphore(PUBLIC_POLL_CONCURRENCY)
         self.alerted_month: Optional[str] = None              # month the limit alert was already sent for
         self.alert_retry_at: float = 0.0
         self.poll_logs_task.start()
@@ -316,6 +326,38 @@ class RobloxAuditLogger(commands.Cog):
     # ------------------------------------------------------------------
     def _count_request(self):
         self.guard.add(REQUEST_OVERHEAD_BYTES + self._cookie_len)
+
+    async def _roblox_request_slot(self):
+        """Waits for this request's turn. Every Roblox request in the bot goes through here,
+        so groups can never fire dozens of requests at the same moment, and a 429 pauses all of them."""
+        while True:
+            now = time.time()
+            wait = max(self._roblox_next_at - now, self._roblox_blocked_until - now)
+            if wait <= 0:
+                self._roblox_next_at = now + ROBLOX_MIN_GAP
+                break
+            await asyncio.sleep(wait)
+        self._count_request()
+
+    def _roblox_penalize(self, retry_after: Any = None):
+        """Roblox said 429: pause all Roblox requests (Retry-After if it sent one, else 10s, 20s, ... 120s)."""
+        now = time.time()
+        try:
+            server_wait = float(retry_after) if retry_after is not None else 0.0
+        except (TypeError, ValueError):
+            server_wait = 0.0
+
+        if now >= self._roblox_blocked_until:  # a new block (many requests fail at once, count it once)
+            wait = min(server_wait, 300.0) if server_wait > 0 else self._roblox_penalty
+            self._roblox_penalty = min(self._roblox_penalty * 2, ROBLOX_PENALTY_MAX)
+            self._roblox_blocked_until = now + wait
+            log.warning("Roblox rate limit hit (429). Pausing all Roblox requests for %.0fs.", wait)
+        elif server_wait > 0:
+            self._roblox_blocked_until = max(self._roblox_blocked_until, now + min(server_wait, 300.0))
+
+    async def _run_public_poll(self, *args):
+        async with self._public_sem:  # one group at a time
+            await self.poll_public_mode(*args)
 
     async def _get_configs(self, db) -> List[Dict[str, Any]]:
         """Saved setups, re-read from MongoDB at most once a minute (or after a change)."""
@@ -450,19 +492,16 @@ class RobloxAuditLogger(commands.Cog):
         session = await self.get_http_session()
         for attempt in range(max_retries):
             is_last = attempt == max_retries - 1
-            self._count_request()
+            await self._roblox_request_slot()
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
+                        self._roblox_penalty = ROBLOX_PENALTY_START
                         return await resp.json()
 
                     if resp.status == 429:
-                        retry_after = resp.headers.get("Retry-After", "")
-                        delay = float(retry_after) if retry_after.replace(".", "", 1).isdigit() else 2.0 * (attempt + 1)
-                        log.warning("Rate limited (429) on %s", url)
-                        if not is_last:
-                            await asyncio.sleep(min(delay, 15.0))
-                        continue
+                        self._roblox_penalize(resp.headers.get("Retry-After"))
+                        continue  # the next attempt waits in the queue until the pause is over
 
                     if resp.status in (500, 502, 503, 504):
                         if not is_last:
@@ -629,17 +668,25 @@ class RobloxAuditLogger(commands.Cog):
             last_audit_key: Optional[str] = None
             mode = "audit_log"
 
-            self._count_request()
-            try:
-                async with session.get(audit_url) as resp:
-                    if resp.status == 200:
-                        body = await resp.json()
-                        logs = body.get("data", [])
-                        # Empty string = "log is empty, anything that appears later is new"
-                        last_audit_key = audit_entry_key(logs[0]) if logs else ""
-                    else:
+            for _attempt in range(3):
+                await self._roblox_request_slot()
+                try:
+                    async with session.get(audit_url) as resp:
+                        if resp.status == 200:
+                            body = await resp.json()
+                            logs = body.get("data", [])
+                            # Empty string = "log is empty, anything that appears later is new"
+                            last_audit_key = audit_entry_key(logs[0]) if logs else ""
+                            break
+                        if resp.status == 429:
+                            self._roblox_penalize(resp.headers.get("Retry-After"))
+                            continue  # a busy moment is not "no cookie access": try again
                         mode = "public_polling"
-            except Exception:
+                        break
+                except Exception:
+                    mode = "public_polling"
+                    break
+            else:
                 mode = "public_polling"
 
             guild_id = str(interaction.guild.id)
@@ -1015,6 +1062,9 @@ class RobloxAuditLogger(commands.Cog):
         tracker = self.group_trackers.get(key)
         if tracker is None:
             tracker = self.group_trackers[key] = GroupTracker(group_id)
+            # Spread the groups out so they do not all poll in the same second after a restart
+            base = AUDIT_POLL_INTERVAL if mode == "audit_log" else tracker.current_interval
+            tracker.last_polled = time.time() - base + random.uniform(0, base)
 
         if mode == "audit_log":
             # Throttle so many groups do not hammer the audit-log endpoint every 10s
@@ -1030,7 +1080,7 @@ class RobloxAuditLogger(commands.Cog):
 
         tracker.last_polled = time.time()  # Claim the slot so the next tick does not start a duplicate
         task = asyncio.create_task(
-            self.poll_public_mode(db, cfg, channel, group_id, group_name, min_rank_val, tracker)
+            self._run_public_poll(db, cfg, channel, group_id, group_name, min_rank_val, tracker)
         )
         self.public_tasks[key] = task  # Keep a reference so the task is not garbage collected
         task.add_done_callback(lambda t, k=key: self._on_public_task_done(k, t))
@@ -1046,14 +1096,21 @@ class RobloxAuditLogger(commands.Cog):
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
         url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
 
-        self._count_request()
+        await self._roblox_request_slot()
         try:
             async with session.get(url) as resp:
                 status = resp.status
+                retry_after = resp.headers.get("Retry-After")
                 body = await resp.json() if status == 200 else None
         except Exception:
             log.warning("Audit log request failed for group %s", group_id, exc_info=True)
             return
+
+        if status == 429:
+            self._roblox_penalize(retry_after)
+            return
+        if status == 200:
+            self._roblox_penalty = ROBLOX_PENALTY_START
 
         if status in (401, 403):
             log.warning("Audit log returned %s for group %s. Switching it to public polling.", status, group_id)
