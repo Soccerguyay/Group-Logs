@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import calendar
 import time
 import random
 import hashlib
@@ -31,6 +32,29 @@ DB_NAME = "roblox_audit_logger"
 AUDIT_POLL_INTERVAL = 30      # Seconds between audit-log polls per group
 ROLES_CACHE_TTL = 3600        # Seconds to cache a group's role list
 MAX_PAGES_PER_ROLE = 2        # 2 pages x 100 = 200 members per role (bandwidth cap)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- Bandwidth protection ------------------------------------------------
+# Render's free plan includes 5 GB of outbound data per month for the whole workspace.
+# The bot counts what it sends and slows down (or pauses) before that budget runs out.
+# Set BANDWIDTH_BUDGET_MB lower if several bots share one Render workspace.
+BANDWIDTH_BUDGET_BYTES = int(_env_float("BANDWIDTH_BUDGET_MB", 3000) * 1024 * 1024)
+BANDWIDTH_PAUSE_AT = 0.98      # Stop polling at 98% of the budget until the next month
+MAX_SLOWDOWN = 12.0            # Never stretch poll intervals more than 12x
+REQUEST_OVERHEAD_BYTES = 1200  # Estimated size of one outgoing HTTP request (headers)
+EMBED_SEND_BYTES = 3000        # Estimated size of one Discord embed message
+CONFIG_REFRESH_SECONDS = 60    # How often saved setups are re-read from MongoDB
+USAGE_FLUSH_SECONDS = 600      # How often the usage counter is saved to MongoDB
+
+# The saved setups are scanned without any old saved member list (rosters live in memory only)
+CONFIG_PROJECTION = {"member_cache": 0}
 
 log = logging.getLogger("roblox_audit")
 
@@ -98,6 +122,68 @@ def error_embed(title: str, description: Optional[str] = None) -> discord.Embed:
 
 
 # ==========================================
+# BANDWIDTH GUARD
+# ==========================================
+class BandwidthGuard:
+    """Counts the data this bot sends out and slows polling down before a monthly cap is reached.
+
+    It keeps a running total for the month, compares it with how much of the month has
+    passed, and returns a slow-down factor (or None when the budget is used up and
+    polling should pause until next month).
+    """
+
+    def __init__(self, budget_bytes: int):
+        self.budget = max(int(budget_bytes), 0)
+        self.month = self._month_key()
+        self.used = 0
+        self.dirty = False
+
+    @staticmethod
+    def _month_key() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _roll(self):
+        key = self._month_key()
+        if key != self.month:
+            self.month, self.used, self.dirty = key, 0, True
+
+    def add(self, nbytes: int):
+        self._roll()
+        self.used += int(nbytes)
+        self.dirty = True
+
+    def restore(self, month: Any, used: Any):
+        """Adds the total saved before a restart (only if it is for the current month)."""
+        self._roll()
+        if month == self.month and isinstance(used, (int, float)):
+            self.used += int(used)
+            self.dirty = True
+
+    @staticmethod
+    def month_progress() -> float:
+        now = datetime.now(timezone.utc)
+        days = calendar.monthrange(now.year, now.month)[1]
+        elapsed = (now.day - 1) * 86400 + now.hour * 3600 + now.minute * 60 + now.second
+        return elapsed / (days * 86400)
+
+    def multiplier(self) -> Optional[float]:
+        """1.0 = full speed, >1 = poll less often, None = budget used up (pause)."""
+        self._roll()
+        if self.budget <= 0:
+            return 1.0
+        fraction = self.used / self.budget
+        if fraction >= BANDWIDTH_PAUSE_AT:
+            return None
+        pace = fraction / max(self.month_progress(), 0.05)  # >1 means spending faster than the month allows
+        return 1.0 if pace <= 1.0 else min(pace, MAX_SLOWDOWN)
+
+    def summary(self) -> str:
+        self._roll()
+        mb = 1024 * 1024
+        return f"{self.used / mb:.0f} / {self.budget / mb:.0f} MB this month"
+
+
+# ==========================================
 # DYNAMIC POLLING TRACKER
 # ==========================================
 class GroupTracker:
@@ -127,8 +213,8 @@ class GroupTracker:
         else:                          # Active -> every 5 minutes
             self.current_interval = 300
 
-    def is_due(self) -> bool:
-        return (time.time() - self.last_polled) >= self.current_interval
+    def is_due(self, multiplier: float = 1.0) -> bool:
+        return (time.time() - self.last_polled) >= self.current_interval * multiplier
 
 
 # ==========================================
@@ -145,6 +231,16 @@ class RobloxAuditLogger(commands.Cog):
         self.initialized_groups: Set[Tuple[str, int]] = set() # (guild_id, group_id) synced this run
         self.public_tasks: Dict[Any, asyncio.Task] = {}       # One running public poll per config
         self.last_cycle_at: float = time.time()               # Heartbeat for the watchdog
+        self.guard = BandwidthGuard(BANDWIDTH_BUDGET_BYTES)
+        self._cookie_len: int = len((os.getenv("ROBLOX_COOKIE") or "").strip())
+        self.configs: List[Dict[str, Any]] = []               # saved setups, refreshed every minute
+        self.configs_loaded_at: float = 0.0
+        self.configs_dirty: bool = True
+        self.member_caches: Dict[Any, Dict[str, Any]] = {}    # roster per config, memory only
+        self.usage_loaded: bool = False
+        self.usage_flushed_at: float = 0.0
+        self.cleaned_old_rosters: bool = False
+        self.guard_state: str = "normal"
         self.poll_logs_task.start()
         self.watchdog_task.start()
 
@@ -153,6 +249,9 @@ class RobloxAuditLogger(commands.Cog):
         self.watchdog_task.cancel()
         for task in list(self.public_tasks.values()):
             task.cancel()
+        db = get_db()
+        if db is not None:
+            await self._flush_usage(db, force=True)
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -170,6 +269,7 @@ class RobloxAuditLogger(commands.Cog):
         return embed
 
     async def _send(self, channel, embed: discord.Embed):
+        self.guard.add(EMBED_SEND_BYTES)
         try:
             await channel.send(embed=embed)
         except discord.Forbidden:
@@ -196,6 +296,81 @@ class RobloxAuditLogger(commands.Cog):
                 if r.get("name") == role_name:
                     return r.get("rank", 0)
         return None
+
+    # ------------------------------------------------------------------
+    # Bandwidth and database helpers
+    # ------------------------------------------------------------------
+    def _count_request(self):
+        self.guard.add(REQUEST_OVERHEAD_BYTES + self._cookie_len)
+
+    async def _get_configs(self, db) -> List[Dict[str, Any]]:
+        """Saved setups, re-read from MongoDB at most once a minute (or after a change)."""
+        now = time.time()
+        if self.configs_dirty or now - self.configs_loaded_at >= CONFIG_REFRESH_SECONDS:
+            self.configs = await db["group_configs"].find({}, CONFIG_PROJECTION).to_list(length=1000)
+            self.guard.add(600)
+            self.configs_loaded_at = now
+            self.configs_dirty = False
+        return self.configs
+
+    async def _update_config(self, db, cfg: Dict[str, Any], fields: Optional[Dict[str, Any]] = None,
+                             unset: Optional[List[str]] = None):
+        """Small database update that also keeps the in-memory copy in step."""
+        update: Dict[str, Any] = {}
+        if fields:
+            update["$set"] = fields
+        if unset:
+            update["$unset"] = {name: "" for name in unset}
+        if not update:
+            return
+        await db["group_configs"].update_one({"_id": cfg["_id"]}, update)
+        self.guard.add(600)
+        if fields:
+            cfg.update(fields)
+        for name in unset or []:
+            cfg.pop(name, None)
+
+    async def _flush_usage(self, db, force: bool = False):
+        if not self.guard.dirty:
+            return
+        now = time.time()
+        if not force and now - self.usage_flushed_at < USAGE_FLUSH_SECONDS:
+            return
+        try:
+            await db["usage"].update_one(
+                {"_id": "bandwidth"},
+                {"$set": {"month": self.guard.month, "used": self.guard.used}},
+                upsert=True,
+            )
+            self.guard.dirty = False
+            self.usage_flushed_at = now
+        except Exception:
+            log.warning("Could not save the bandwidth counter", exc_info=True)
+
+    async def _sync_usage(self, db):
+        """Loads the saved monthly total once after a restart, then saves it every few minutes."""
+        if not self.usage_loaded:
+            self.usage_loaded = True
+            try:
+                doc = await db["usage"].find_one({"_id": "bandwidth"})
+                if doc:
+                    self.guard.restore(doc.get("month"), doc.get("used"))
+            except Exception:
+                log.warning("Could not load the bandwidth counter", exc_info=True)
+        if not self.cleaned_old_rosters:
+            self.cleaned_old_rosters = True
+            try:
+                # Rosters used to be saved in MongoDB on every poll. They live in memory now.
+                await db["group_configs"].update_many({"member_cache": {"$exists": True}}, {"$unset": {"member_cache": ""}})
+            except Exception:
+                log.warning("Could not clean up old saved rosters", exc_info=True)
+        await self._flush_usage(db)
+
+    def _note_guard_state(self, multiplier: Optional[float]):
+        state = "paused" if multiplier is None else ("slowed" if multiplier > 1.0 else "normal")
+        if state != self.guard_state:
+            log.warning("Bandwidth guard is now %s (%s)", state, self.guard.summary())
+            self.guard_state = state
 
     # ------------------------------------------------------------------
     # Fun listener (1 in 10 chance when pinged)
@@ -236,6 +411,7 @@ class RobloxAuditLogger(commands.Cog):
         session = await self.get_http_session()
         for attempt in range(max_retries):
             is_last = attempt == max_retries - 1
+            self._count_request()
             try:
                 async with session.get(url) as resp:
                     if resp.status == 200:
@@ -414,6 +590,7 @@ class RobloxAuditLogger(commands.Cog):
             last_audit_key: Optional[str] = None
             mode = "audit_log"
 
+            self._count_request()
             try:
                 async with session.get(audit_url) as resp:
                     if resp.status == 200:
@@ -440,23 +617,23 @@ class RobloxAuditLogger(commands.Cog):
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
 
-            update_doc: Dict[str, Any] = {"$set": config_payload}
+            update_doc: Dict[str, Any] = {"$set": config_payload, "$unset": {"member_cache": ""}}
 
             if mode == "public_polling":
-                initial_cache, success, _ = await self._fetch_filtered_group_members(group_id, min_rank_value)
-                config_payload["member_cache"] = initial_cache if success else {}
-                update_doc["$unset"] = {"last_audit_id": ""}
+                update_doc["$unset"]["last_audit_id"] = ""
             else:
                 config_payload["last_audit_id"] = last_audit_key
-                update_doc["$unset"] = {"member_cache": ""}
 
             await db["group_configs"].update_one(
                 {"guild_id": guild_id, "group_id": group_id},
                 update_doc,
                 upsert=True,
             )
+            self.guard.add(1500)
 
-            # Fresh setups already have a baseline, so no deployment sync is needed
+            # Reload the setups on the next tick. In public mode the member list is built
+            # silently in memory on the first poll, so nothing extra is downloaded here.
+            self.configs_dirty = True
             self.initialized_groups.add((guild_id, group_id))
 
             mode_msg = "Audit Log Stream (Cookie)" if mode == "audit_log" else "Public Polling Stream (Fallback)"
@@ -533,7 +710,8 @@ class RobloxAuditLogger(commands.Cog):
             value=(
                 f"Database: `{db_status}`\n"
                 f"Uptime: `{uptime_str}`\n"
-                f"Poll Cycles: `{self.cycle_count}`"
+                f"Poll Cycles: `{self.cycle_count}`\n"
+                f"Bandwidth: `{self.guard.summary()}`"
             ),
             inline=True,
         )
@@ -666,6 +844,8 @@ class RobloxAuditLogger(commands.Cog):
         # Clean up in-memory state for the removed config
         key = deleted["_id"]
         self.group_trackers.pop(key, None)
+        self.member_caches.pop(key, None)
+        self.configs_dirty = True
         self.initialized_groups.discard((guild_id, group_id))
         task = self.public_tasks.pop(key, None)
         if task:
@@ -760,18 +940,24 @@ class RobloxAuditLogger(commands.Cog):
         if db is None:
             return
 
-        session = await self.get_http_session()
-        configs = await db["group_configs"].find().to_list(length=1000)
+        await self._sync_usage(db)
+        multiplier = self.guard.multiplier()
+        self._note_guard_state(multiplier)
         self.cycle_count += 1
+        if multiplier is None:
+            return  # Monthly bandwidth budget is used up: stay quiet until next month
+
+        session = await self.get_http_session()
+        configs = await self._get_configs(db)
 
         for cfg in configs:
             # One bad group must never stop the others
             try:
-                await self._poll_one(db, session, cfg)
+                await self._poll_one(db, session, cfg, multiplier)
             except Exception:
                 log.exception("Polling failed for group %s", cfg.get("group_id"))
 
-    async def _poll_one(self, db, session, cfg):
+    async def _poll_one(self, db, session, cfg, multiplier: float = 1.0):
         group_id = cfg.get("group_id")
         group_name = cfg.get("group_name", "Roblox Group")
         channel_id = cfg.get("channel_id")
@@ -793,14 +979,14 @@ class RobloxAuditLogger(commands.Cog):
 
         if mode == "audit_log":
             # Throttle so many groups do not hammer the audit-log endpoint every 10s
-            if time.time() - tracker.last_polled < AUDIT_POLL_INTERVAL:
+            if time.time() - tracker.last_polled < AUDIT_POLL_INTERVAL * multiplier:
                 return
             tracker.last_polled = time.time()
             await self.poll_audit_log_mode(db, session, cfg, channel, group_id, group_name, min_rank_val)
             return
 
         # Public polling: only when due, and never two at once for the same config
-        if key in self.public_tasks or not tracker.is_due():
+        if key in self.public_tasks or not tracker.is_due(multiplier):
             return
 
         tracker.last_polled = time.time()  # Claim the slot so the next tick does not start a duplicate
@@ -821,6 +1007,7 @@ class RobloxAuditLogger(commands.Cog):
     async def poll_audit_log_mode(self, db, session, cfg, channel, group_id, group_name, min_rank_val):
         url = f"https://groups.roblox.com/v1/groups/{group_id}/audit-log?limit=25&sortOrder=Desc"
 
+        self._count_request()
         try:
             async with session.get(url) as resp:
                 status = resp.status
@@ -831,7 +1018,7 @@ class RobloxAuditLogger(commands.Cog):
 
         if status in (401, 403):
             log.warning("Audit log returned %s for group %s. Switching it to public polling.", status, group_id)
-            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"mode": "public_polling"}})
+            await self._update_config(db, cfg, {"mode": "public_polling"}, unset=["last_audit_id"])
             return
 
         if status != 200 or not body:
@@ -847,7 +1034,7 @@ class RobloxAuditLogger(commands.Cog):
 
         # RE-DEPLOYMENT / FIRST RUN SYNC: set the watermark without logging old entries
         if sync_key not in self.initialized_groups or last_key is None:
-            await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"last_audit_id": latest_key}})
+            await self._update_config(db, cfg, {"last_audit_id": latest_key})
             self.initialized_groups.add(sync_key)
             return
 
@@ -861,10 +1048,7 @@ class RobloxAuditLogger(commands.Cog):
         if not new_logs:
             return
 
-        await db["group_configs"].update_one(
-            {"_id": cfg["_id"]},
-            {"$set": {"last_audit_id": audit_entry_key(new_logs[0])}},
-        )
+        await self._update_config(db, cfg, {"last_audit_id": audit_entry_key(new_logs[0])})
 
         for entry in reversed(new_logs):
             try:
@@ -873,7 +1057,7 @@ class RobloxAuditLogger(commands.Cog):
                 log.exception("Failed to format audit entry for group %s", group_id)
 
     async def poll_public_mode(self, db, cfg, channel, group_id, group_name, min_rank_val, tracker: GroupTracker):
-        cached_members: Dict[str, Dict[str, Any]] = cfg.get("member_cache", {}) or {}
+        key = cfg["_id"]
         has_changes = False
 
         try:
@@ -883,12 +1067,12 @@ class RobloxAuditLogger(commands.Cog):
             if not is_complete or not current_members:
                 return
 
-            sync_key = (cfg.get("guild_id"), group_id)
+            entry = self.member_caches.get(key)
+            cached_members: Dict[str, Dict[str, Any]] = entry["members"] if entry else {}
 
-            # RE-DEPLOYMENT / FIRST RUN SYNC: silently refresh the baseline
-            if sync_key not in self.initialized_groups or not cached_members:
-                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": current_members}})
-                self.initialized_groups.add(sync_key)
+            # FIRST RUN / RESTART / RANK-FILTER CHANGE: silently build the baseline in memory
+            if not entry or entry["min"] != min_rank_val or not cached_members:
+                self.member_caches[key] = {"min": min_rank_val, "members": current_members}
                 return
 
             now_fmt = f"<t:{int(datetime.now(timezone.utc).timestamp())}:F>"
@@ -969,9 +1153,8 @@ class RobloxAuditLogger(commands.Cog):
                 )
                 await self._send(channel, embed)
 
-            # Only write to the database when something actually changed
-            if has_changes:
-                await db["group_configs"].update_one({"_id": cfg["_id"]}, {"$set": {"member_cache": updated_cache}})
+            # Remember the new roster in memory (nothing is written to the database)
+            self.member_caches[key] = {"min": min_rank_val, "members": updated_cache}
 
         except Exception:
             log.exception("Public polling failed for group %s", group_id)
