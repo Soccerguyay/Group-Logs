@@ -16,6 +16,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 
+# When Discord/Cloudflare blocks this host's IP (429 at login), retrying fast
+# only extends the block. Wait much longer between attempts.
+BLOCKED_DELAY_START = 600    # 10 minutes
+BLOCKED_DELAY_MAX = 3600     # 1 hour
+
 
 class LogBot(commands.Bot):
     def __init__(self):
@@ -34,12 +39,23 @@ class LogBot(commands.Bot):
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)
 
 
+def _retry_after(e: discord.HTTPException) -> int:
+    """Seconds the server asked us to wait, or 0 if it did not say."""
+    try:
+        value = e.response.headers.get("Retry-After")
+        return int(float(value)) if value else 0
+    except Exception:
+        return 0
+
+
 async def run_forever(token: str):
     delay = 15
+    blocked_delay = BLOCKED_DELAY_START
     while True:
         bot = LogBot()
         set_bot(bot)
         started = time.monotonic()
+        wait = None
         try:
             async with bot:
                 await bot.start(token)
@@ -52,14 +68,26 @@ async def run_forever(token: str):
             return
         except discord.HTTPException as e:
             log.error("Discord HTTP error %s: %s", e.status, e)
+            if e.status == 429:
+                wait = min(max(_retry_after(e), blocked_delay), BLOCKED_DELAY_MAX)
+                blocked_delay = min(blocked_delay * 2, BLOCKED_DELAY_MAX)
+                log.error(
+                    "This host's IP is being rate limited by Discord. "
+                    "Waiting %ss before the next attempt (retrying sooner can extend the block).",
+                    wait,
+                )
         except Exception:
             log.exception("Bot crashed")
 
-        if time.monotonic() - started > 600:
-            delay = 15  # It ran for a while, so start the backoff over
-        log.info("Starting the bot again in %ss", delay)
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 600)
+        if wait is None:
+            if time.monotonic() - started > 600:
+                delay = 15  # It ran for a while, so start the backoff over
+                blocked_delay = BLOCKED_DELAY_START
+            wait = delay
+            delay = min(delay * 2, 600)
+
+        log.info("Starting the bot again in %ss", wait)
+        await asyncio.sleep(wait)
 
 
 if __name__ == "__main__":
