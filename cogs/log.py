@@ -56,6 +56,18 @@ USAGE_FLUSH_SECONDS = 600      # How often the usage counter is saved to MongoDB
 # The saved setups are scanned without any old saved member list (rosters live in memory only)
 CONFIG_PROJECTION = {"member_cache": 0}
 
+# Where to warn when the bandwidth budget is used up.
+# Set ALERT_USER_IDS="123,456" on Render to ping someone else (default: the authorized users).
+ALERT_CHANNEL_ID = 1574543209076359188
+
+
+def _alert_user_ids() -> List[int]:
+    ids = [int(p) for p in re.findall(r"\d+", os.getenv("ALERT_USER_IDS", ""))]
+    return ids or list(AUTHORIZED_USER_IDS)
+
+
+ALERT_USER_IDS = _alert_user_ids()
+
 log = logging.getLogger("roblox_audit")
 
 _mongo_client = None
@@ -241,6 +253,8 @@ class RobloxAuditLogger(commands.Cog):
         self.usage_flushed_at: float = 0.0
         self.cleaned_old_rosters: bool = False
         self.guard_state: str = "normal"
+        self.alerted_month: Optional[str] = None              # month the limit alert was already sent for
+        self.alert_retry_at: float = 0.0
         self.poll_logs_task.start()
         self.watchdog_task.start()
 
@@ -339,7 +353,7 @@ class RobloxAuditLogger(commands.Cog):
         try:
             await db["usage"].update_one(
                 {"_id": "bandwidth"},
-                {"$set": {"month": self.guard.month, "used": self.guard.used}},
+                {"$set": {"month": self.guard.month, "used": self.guard.used, "alerted": self.alerted_month}},
                 upsert=True,
             )
             self.guard.dirty = False
@@ -355,6 +369,7 @@ class RobloxAuditLogger(commands.Cog):
                 doc = await db["usage"].find_one({"_id": "bandwidth"})
                 if doc:
                     self.guard.restore(doc.get("month"), doc.get("used"))
+                    self.alerted_month = doc.get("alerted")
             except Exception:
                 log.warning("Could not load the bandwidth counter", exc_info=True)
         if not self.cleaned_old_rosters:
@@ -366,11 +381,35 @@ class RobloxAuditLogger(commands.Cog):
                 log.warning("Could not clean up old saved rosters", exc_info=True)
         await self._flush_usage(db)
 
-    def _note_guard_state(self, multiplier: Optional[float]):
+    async def _note_guard_state(self, db, multiplier: Optional[float]):
         state = "paused" if multiplier is None else ("slowed" if multiplier > 1.0 else "normal")
         if state != self.guard_state:
             log.warning("Bandwidth guard is now %s (%s)", state, self.guard.summary())
             self.guard_state = state
+        if state == "paused":
+            await self._alert_budget_reached(db)
+
+    async def _alert_budget_reached(self, db):
+        """Pings the owners once per month when the bandwidth budget is used up."""
+        if self.alerted_month == self.guard.month or time.time() < self.alert_retry_at:
+            return
+        self.alert_retry_at = time.time() + 600  # If sending fails, try again in 10 minutes
+        try:
+            channel = self.bot.get_channel(ALERT_CHANNEL_ID) or await self.bot.fetch_channel(ALERT_CHANNEL_ID)
+            mentions = " ".join(f"<@{uid}>" for uid in ALERT_USER_IDS)
+            name = self.bot.user.name if self.bot.user else "The bot"
+            await channel.send(
+                f"{mentions}\n**{name}: bandwidth limit reached** ({self.guard.summary()}).\n"
+                f"Polling is paused until the next month (UTC). The bot is still online and slash commands still work. "
+                f"To keep logging sooner, raise `BANDWIDTH_BUDGET_MB` on Render and restart the service.",
+                allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+            )
+        except Exception:
+            log.warning("Could not send the bandwidth limit alert", exc_info=True)
+            return
+        self.alerted_month = self.guard.month
+        self.guard.dirty = True
+        await self._flush_usage(db, force=True)
 
     # ------------------------------------------------------------------
     # Fun listener (1 in 10 chance when pinged)
@@ -942,7 +981,7 @@ class RobloxAuditLogger(commands.Cog):
 
         await self._sync_usage(db)
         multiplier = self.guard.multiplier()
-        self._note_guard_state(multiplier)
+        await self._note_guard_state(db, multiplier)
         self.cycle_count += 1
         if multiplier is None:
             return  # Monthly bandwidth budget is used up: stay quiet until next month
