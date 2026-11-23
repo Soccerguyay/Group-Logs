@@ -69,8 +69,12 @@ async def run_forever(token: str):
         except discord.HTTPException as e:
             log.error("Discord HTTP error %s: %s", e.status, e)
             if e.status == 429:
-                wait = min(max(_retry_after(e), blocked_delay), BLOCKED_DELAY_MAX)
-                blocked_delay = min(blocked_delay * 2, BLOCKED_DELAY_MAX)
+                server_wait = _retry_after(e)
+                if server_wait > 0:
+                    wait = server_wait + 5  # Do exactly what Discord says, plus a small buffer
+                else:
+                    wait = blocked_delay    # No header sent: fall back to a growing wait
+                    blocked_delay = min(blocked_delay * 2, BLOCKED_DELAY_MAX)
                 log.error(
                     "This host's IP is being rate limited by Discord. "
                     "Waiting %ss before the next attempt (retrying sooner can extend the block).",
